@@ -3,6 +3,24 @@ local M = {}
 
 local config = require("todoist.config")
 
+-- Helper function to calculate effective indentation (treating tabs as spaces)
+local function get_effective_indent(line)
+	local indent_str = line:match("^(%s*)")
+	local effective_indent = 0
+
+	for i = 1, #indent_str do
+		local char = indent_str:sub(i, i)
+		if char == "\t" then
+			-- Treat tab as 2 spaces (or 4, depending on your preference)
+			effective_indent = effective_indent + 2
+		elseif char == " " then
+			effective_indent = effective_indent + 1
+		end
+	end
+
+	return effective_indent, indent_str
+end
+
 function M.project_to_markdown(project_data)
 	local lines = {}
 	local extmarks = {}
@@ -374,8 +392,16 @@ function M.parse_task_description(lines, task_line_index, task_indent_level)
 	local description_lines = {}
 	local i = task_line_index + 1
 
+	if config.is_debug() then
+		print("DEBUG: Parsing description for task at line", task_line_index, "with indent level", task_indent_level)
+		print("DEBUG: Total lines available:", #lines)
+	end
+
 	-- Skip empty line immediately after task (if it exists)
 	if i <= #lines and lines[i] == "" then
+		if config.is_debug() then
+			print("DEBUG: Skipping empty line at", i)
+		end
 		i = i + 1
 	end
 
@@ -383,27 +409,96 @@ function M.parse_task_description(lines, task_line_index, task_indent_level)
 	while i <= #lines do
 		local line = lines[i]
 
-		-- Stop if we hit another task, section, or less indented content
+		if config.is_debug() then
+			print("DEBUG: Examining line", i, ":", line)
+		end
+
+		-- Stop if we hit another task or section
 		if line:match("^%s*%-") or line:match("^#") then
+			if config.is_debug() then
+				print("DEBUG: Found another task/section at line", i, "stopping description parsing")
+			end
 			break
 		end
 
-		-- Stop if we hit a line that's not indented enough
-		local line_indent = line:match("^(%s*)")
-		if line ~= "" and #line_indent <= task_indent_level then
-			break
+		-- If we hit a non-empty line, check its effective indentation
+		if line ~= "" then
+			local line_effective_indent, line_indent_str = get_effective_indent(line)
+
+			if config.is_debug() then
+				print(
+					"DEBUG: Line",
+					i,
+					"effective indent:",
+					line_effective_indent,
+					"vs task indent:",
+					task_indent_level,
+					"indent string:",
+					vim.inspect(line_indent_str)
+				)
+			end
+
+			-- Stop only if the line has LESS indentation than the task
+			-- Lines at the same indentation level or higher should be included in the description
+			if line_effective_indent < task_indent_level then
+				if config.is_debug() then
+					print(
+						"DEBUG: Line",
+						i,
+						"has insufficient effective indent (",
+						line_effective_indent,
+						"vs",
+						task_indent_level,
+						"), stopping description parsing"
+					)
+				end
+				break
+			end
 		end
 
-		-- Add to description (remove task indentation + 2 spaces)
+		-- Add to description (remove appropriate indentation)
 		if line == "" then
 			table.insert(description_lines, "")
+			if config.is_debug() then
+				print("DEBUG: Added empty line to description")
+			end
 		else
-			local expected_indent = string.rep(" ", task_indent_level + 2)
-			if line:sub(1, #expected_indent) == expected_indent then
-				table.insert(description_lines, line:sub(#expected_indent + 1))
+			local expected_effective_indent = task_indent_level + 2
+			local line_effective_indent, line_indent_str = get_effective_indent(line)
+
+			if line_effective_indent >= expected_effective_indent then
+				-- Calculate how much to remove (in characters, not effective spaces)
+				local chars_to_remove = 0
+				local effective_removed = 0
+
+				for j = 1, #line_indent_str do
+					local char = line_indent_str:sub(j, j)
+					chars_to_remove = chars_to_remove + 1
+
+					if char == "\t" then
+						effective_removed = effective_removed + 2
+					elseif char == " " then
+						effective_removed = effective_removed + 1
+					end
+
+					if effective_removed >= expected_effective_indent then
+						break
+					end
+				end
+
+				local desc_line = line:sub(chars_to_remove + 1)
+				table.insert(description_lines, desc_line)
+				if config.is_debug() then
+					print("DEBUG: Added description line (removed", chars_to_remove, "chars):", desc_line)
+				end
 			else
-				-- Less indented than expected, might be part of description still
-				table.insert(description_lines, line:gsub("^%s*", ""))
+				-- Line has some indentation but less than expected
+				-- Still include it but with minimal processing
+				local desc_line = line:gsub("^%s*", "")
+				table.insert(description_lines, desc_line)
+				if config.is_debug() then
+					print("DEBUG: Added less-indented description line:", desc_line)
+				end
 			end
 		end
 
@@ -413,9 +508,19 @@ function M.parse_task_description(lines, task_line_index, task_indent_level)
 	-- Remove trailing empty lines
 	while #description_lines > 0 and description_lines[#description_lines] == "" do
 		table.remove(description_lines)
+		if config.is_debug() then
+			print("DEBUG: Removed trailing empty line")
+		end
 	end
 
-	return table.concat(description_lines, "\n"), i - 1
+	local final_description = table.concat(description_lines, "\n")
+
+	if config.is_debug() then
+		print("DEBUG: Final description:", final_description)
+		print("DEBUG: Stopped parsing at line", i - 1)
+	end
+
+	return final_description, i - 1
 end
 
 function M.parse_markdown_to_changes(lines, extmarks)
@@ -464,6 +569,10 @@ function M.parse_markdown_to_changes(lines, extmarks)
 		local line = lines[i]
 		local line_num = i - 1
 
+		if config.is_debug() then
+			print("DEBUG: Processing line", i, ":", line)
+		end
+
 		-- Check for section headers
 		local section_title = line:match("^## (.+)$")
 		if config.is_valid(section_title) then
@@ -503,13 +612,27 @@ function M.parse_markdown_to_changes(lines, extmarks)
 			i = i + 1
 		else
 			-- Check for tasks
-			local indent, checkbox, content = line:match("^(%s*)%- %[([%sx])%] (.+)$")
+			local indent_str, checkbox, content = line:match("^(%s*)%- %[([%sx])%] (.+)$")
 			if config.is_valid(content) then
-				local depth = math.floor(#indent / 2)
+				local task_effective_indent, _ = get_effective_indent(line)
+				local depth = math.floor(task_effective_indent / 2)
 				local is_completed = checkbox == "x"
 
-				-- Parse task description
-				local description, last_desc_line = M.parse_task_description(lines, i, #indent)
+				if config.is_debug() then
+					print(
+						"DEBUG: Found task:",
+						content,
+						"at line",
+						i,
+						"with effective indent",
+						task_effective_indent,
+						"indent string:",
+						vim.inspect(indent_str)
+					)
+				end
+
+				-- Parse task description (use effective indentation)
+				local description, last_desc_line = M.parse_task_description(lines, i, task_effective_indent)
 
 				local extmark_data = extmark_by_line[line_num]
 
@@ -565,6 +688,9 @@ function M.parse_markdown_to_changes(lines, extmarks)
 
 				-- Skip to after the description
 				i = last_desc_line + 1
+				if config.is_debug() then
+					print("DEBUG: Continuing parsing from line", i)
+				end
 			else
 				i = i + 1
 			end
