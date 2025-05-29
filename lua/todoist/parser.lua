@@ -77,11 +77,15 @@ function M.project_to_markdown(project_data)
 				line = #lines - 1,
 				col = 0,
 				opts = {
-					end_line = #lines - 1,
-					end_col = -1,
-					todoist_type = "section",
-					todoist_id = tostring(section_data.section.id),
-					todoist_name = section_name,
+					-- Don't specify end_col - let it default to the end of line
+					right_gravity = false,
+					hl_mode = "combine",
+				},
+				-- Store our custom data separately
+				todoist_data = {
+					type = "section",
+					id = tostring(section_data.section.id),
+					name = section_name,
 				},
 			})
 			table.insert(lines, "")
@@ -169,14 +173,18 @@ function M.add_task_to_markdown(task, lines, extmarks, depth, task_children)
 		line = #lines - 1,
 		col = 0,
 		opts = {
-			end_line = #lines - 1,
-			end_col = -1,
-			todoist_type = "task",
-			todoist_id = tostring(task.id),
-			todoist_content = task_content,
-			todoist_completed = is_completed,
-			parent_id = config.is_valid(task.parent_id) and tostring(task.parent_id) or vim.NIL,
-			section_id = config.is_valid(task.section_id) and tostring(task.section_id) or vim.NIL,
+			-- Don't specify end_col - let it default to the end of line
+			right_gravity = false,
+			hl_mode = "combine",
+		},
+		-- Store our custom data separately
+		todoist_data = {
+			type = "task",
+			id = tostring(task.id),
+			content = task_content,
+			completed = is_completed,
+			parent_id = config.is_valid(task.parent_id) and tostring(task.parent_id) or nil,
+			section_id = config.is_valid(task.section_id) and tostring(task.section_id) or nil,
 		},
 	})
 
@@ -209,31 +217,48 @@ function M.add_task_to_markdown(task, lines, extmarks, depth, task_children)
 	end
 end
 
+-- Global storage for extmark data (since we can't store custom data in extmarks directly)
+local extmark_data_store = {}
+
 function M.set_extmarks(buf, ns_id, extmarks)
 	if config.is_debug() then
 		print("DEBUG: Setting", #extmarks, "extmarks in buffer", buf)
 	end
 
+	-- Clear previous data for this buffer
+	extmark_data_store[buf] = {}
+
 	for i, mark in ipairs(extmarks) do
-		local success, err = pcall(function()
+		local success, result = pcall(function()
 			local mark_id = vim.api.nvim_buf_set_extmark(buf, ns_id, mark.line, mark.col, mark.opts)
-			if config.is_debug() then
-				print(
-					"DEBUG: Set extmark",
-					i,
-					"at line",
-					mark.line,
-					"with ID",
-					mark_id,
-					"type:",
-					mark.opts.todoist_type
-				)
+
+			-- Store our custom data separately, indexed by the extmark ID
+			if mark.todoist_data then
+				extmark_data_store[buf][mark_id] = mark.todoist_data
+
+				if config.is_debug() then
+					print(
+						"DEBUG: Set extmark",
+						i,
+						"at line",
+						mark.line,
+						"with ID",
+						mark_id,
+						"type:",
+						mark.todoist_data.type,
+						"todoist_id:",
+						mark.todoist_data.id
+					)
+				end
 			end
+
+			return mark_id
 		end)
 
-		if not success and config.is_debug() then
-			print("DEBUG: Error:", err)
-			print("DEBUG: Failed to set extmark", i, "at line", mark.line)
+		if not success then
+			if config.is_debug() then
+				print("DEBUG: Failed to set extmark", i, "at line", mark.line, "error:", result)
+			end
 		end
 	end
 
@@ -242,8 +267,37 @@ function M.set_extmarks(buf, ns_id, extmarks)
 		vim.schedule(function()
 			local test_extmarks = vim.api.nvim_buf_get_extmarks(buf, ns_id, 0, -1, { details = true })
 			print("DEBUG: Verification - found", #test_extmarks, "extmarks after setting")
+			print("DEBUG: Stored data for", vim.tbl_count(extmark_data_store[buf] or {}), "extmarks")
 		end)
 	end
+end
+
+-- Get extmarks with their associated todoist data
+function M.get_extmarks_with_data(buf, ns_id)
+	local extmarks = vim.api.nvim_buf_get_extmarks(buf, ns_id, 0, -1, { details = true })
+	local result = {}
+
+	for _, mark in ipairs(extmarks) do
+		local mark_id = mark[1]
+		local line_num = mark[2]
+		local col_num = mark[3]
+		local opts = mark[4]
+
+		-- Get our stored data
+		local todoist_data = nil
+		if extmark_data_store[buf] and extmark_data_store[buf][mark_id] then
+			todoist_data = extmark_data_store[buf][mark_id]
+		end
+
+		table.insert(result, {
+			mark_id,
+			line_num,
+			col_num,
+			todoist_data, -- This replaces the opts[4] that we were trying to use before
+		})
+	end
+
+	return result
 end
 
 -- Update extmarks with newly created item IDs
@@ -256,26 +310,41 @@ function M.update_extmarks_with_created_items(buf, ns_id, created_items)
 		print("DEBUG: Updating extmarks with created items:", vim.inspect(created_items))
 	end
 
+	-- Initialize storage for this buffer if it doesn't exist
+	if not extmark_data_store[buf] then
+		extmark_data_store[buf] = {}
+	end
+
 	for line_num, item in pairs(created_items) do
 		if config.is_valid(item) and config.is_valid(item.id) then
 			local opts = {
-				end_line = line_num,
-				end_col = -1,
-				todoist_type = item.type,
-				todoist_id = tostring(item.id),
+				-- Don't specify end_col - let it default
+				right_gravity = false,
+				hl_mode = "combine",
+			}
+
+			local todoist_data = {
+				type = item.type,
+				id = tostring(item.id),
 			}
 
 			if item.type == "task" then
-				opts.todoist_content = item.content
-				opts.todoist_completed = item.is_completed or false
-				opts.parent_id = vim.NIL
-				opts.section_id = vim.NIL
+				todoist_data.content = item.content
+				todoist_data.completed = item.is_completed or false
+				todoist_data.parent_id = nil
+				todoist_data.section_id = nil
 			elseif item.type == "section" then
-				opts.todoist_name = item.name
+				todoist_data.name = item.name
 			end
 
-			local success = pcall(function()
-				local mark_id = vim.api.nvim_buf_set_extmark(buf, ns_id, line_num, 0, opts)
+			local success, mark_id = pcall(function()
+				return vim.api.nvim_buf_set_extmark(buf, ns_id, line_num, 0, opts)
+			end)
+
+			if success and mark_id then
+				-- Store our custom data
+				extmark_data_store[buf][mark_id] = todoist_data
+
 				if config.is_debug() then
 					print(
 						"DEBUG: Updated extmark for",
@@ -288,10 +357,8 @@ function M.update_extmarks_with_created_items(buf, ns_id, created_items)
 						mark_id
 					)
 				end
-			end)
-
-			if not success and config.is_debug() then
-				print("DEBUG: Failed to update extmark for", item.type, "at line", line_num)
+			elseif config.is_debug() then
+				print("DEBUG: Failed to update extmark for", item.type, "at line", line_num, "error:", mark_id)
 			end
 		end
 	end
@@ -309,11 +376,6 @@ function M.parse_markdown_to_changes(lines, extmarks)
 
 	if config.is_debug() then
 		print("DEBUG: Parsing changes from", #lines, "lines and", #extmarks, "extmarks")
-		for i, mark in ipairs(extmarks) do
-			if i <= 5 then -- Only show first 5 to avoid spam
-				print("DEBUG: Extmark", i, ":", vim.inspect(mark))
-			end
-		end
 	end
 
 	-- Create lookup tables
@@ -323,14 +385,14 @@ function M.parse_markdown_to_changes(lines, extmarks)
 	-- Build extmark lookup by line number and collect existing IDs
 	for _, mark in ipairs(extmarks) do
 		local line_num = mark[2]
-		local data = mark[4]
+		local data = mark[4] -- This is now our todoist_data
 
-		if config.is_valid(data) and config.is_valid(data.todoist_id) then
+		if config.is_valid(data) and config.is_valid(data.id) then
 			extmark_by_line[line_num] = data
-			existing_ids[data.todoist_id] = true
+			existing_ids[data.id] = true
 
 			if config.is_debug() then
-				print("DEBUG: Found extmark at line", line_num, "for", data.todoist_type, "ID:", data.todoist_id)
+				print("DEBUG: Found extmark at line", line_num, "for", data.type, "ID:", data.id)
 			end
 		end
 	end
@@ -351,22 +413,22 @@ function M.parse_markdown_to_changes(lines, extmarks)
 		if config.is_valid(section_title) then
 			local extmark_data = extmark_by_line[line_num]
 
-			if config.is_valid(extmark_data) and extmark_data.todoist_type == "section" then
+			if config.is_valid(extmark_data) and extmark_data.type == "section" then
 				-- Existing section - check for updates
-				seen_ids[extmark_data.todoist_id] = true
+				seen_ids[extmark_data.id] = true
 
 				-- Check if name changed
-				if extmark_data.todoist_name ~= section_title then
+				if extmark_data.name ~= section_title then
 					table.insert(changes.updated_sections, {
-						id = extmark_data.todoist_id,
+						id = extmark_data.id,
 						name = section_title,
 					})
 					if config.is_debug() then
 						print(
 							"DEBUG: Section updated:",
-							extmark_data.todoist_id,
+							extmark_data.id,
 							"from",
-							extmark_data.todoist_name,
+							extmark_data.name,
 							"to",
 							section_title
 						)
@@ -392,27 +454,27 @@ function M.parse_markdown_to_changes(lines, extmarks)
 
 			local extmark_data = extmark_by_line[line_num]
 
-			if config.is_valid(extmark_data) and extmark_data.todoist_type == "task" then
+			if config.is_valid(extmark_data) and extmark_data.type == "task" then
 				-- Existing task - check for updates
-				seen_ids[extmark_data.todoist_id] = true
+				seen_ids[extmark_data.id] = true
 
 				-- Check if content or completion status changed
-				local content_changed = extmark_data.todoist_content ~= content
-				local completion_changed = extmark_data.todoist_completed ~= is_completed
+				local content_changed = extmark_data.content ~= content
+				local completion_changed = extmark_data.completed ~= is_completed
 
 				if content_changed or completion_changed then
 					table.insert(changes.updated_tasks, {
-						id = extmark_data.todoist_id,
+						id = extmark_data.id,
 						content = content,
 						is_completed = is_completed,
 					})
 					if config.is_debug() then
-						print("DEBUG: Task updated:", extmark_data.todoist_id)
+						print("DEBUG: Task updated:", extmark_data.id)
 						if content_changed then
-							print("  Content changed from:", extmark_data.todoist_content, "to:", content)
+							print("  Content changed from:", extmark_data.content, "to:", content)
 						end
 						if completion_changed then
-							print("  Completion changed from:", extmark_data.todoist_completed, "to:", is_completed)
+							print("  Completion changed from:", extmark_data.completed, "to:", is_completed)
 						end
 					end
 				end
@@ -433,17 +495,17 @@ function M.parse_markdown_to_changes(lines, extmarks)
 
 	-- Find deleted items (existed in extmarks but not seen in current content)
 	for _, mark in ipairs(extmarks) do
-		local data = mark[4]
-		if config.is_valid(data) and config.is_valid(data.todoist_id) and not seen_ids[data.todoist_id] then
-			if data.todoist_type == "section" then
-				table.insert(changes.deleted_sections, data.todoist_id)
+		local data = mark[4] -- This is now our todoist_data
+		if config.is_valid(data) and config.is_valid(data.id) and not seen_ids[data.id] then
+			if data.type == "section" then
+				table.insert(changes.deleted_sections, data.id)
 				if config.is_debug() then
-					print("DEBUG: Section deleted:", data.todoist_id)
+					print("DEBUG: Section deleted:", data.id)
 				end
-			elseif data.todoist_type == "task" then
-				table.insert(changes.deleted_tasks, data.todoist_id)
+			elseif data.type == "task" then
+				table.insert(changes.deleted_tasks, data.id)
 				if config.is_debug() then
-					print("DEBUG: Task deleted:", data.todoist_id)
+					print("DEBUG: Task deleted:", data.id)
 				end
 			end
 		end
@@ -463,4 +525,3 @@ function M.parse_markdown_to_changes(lines, extmarks)
 end
 
 return M
-
