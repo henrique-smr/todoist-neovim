@@ -47,18 +47,31 @@ function M.sync_buffer_changes(project_id, lines, extmarks, callback)
 			print("DEBUG: Merged changes:", vim.inspect(merged_changes))
 		end
 
-		-- Step 5: Apply changes and return updated data
+		-- Step 5: Apply changes
 		M.execute_sync_operations(project_id, merged_changes, lines, extmarks, function(sync_result)
 			if sync_result.error then
 				callback(sync_result)
 				return
 			end
 
-			-- Step 6: Fetch final state and return for rendering
+			-- Step 6: Always fetch final state for rendering
+			if config.is_debug() then
+				print("DEBUG: Fetching final project state after sync")
+			end
+
 			api.get_project_data(project_id, function(final_result)
 				if final_result.error then
 					callback(final_result)
 					return
+				end
+
+				if config.is_debug() then
+					print(
+						"DEBUG: Final fetch complete - tasks:",
+						#(final_result.data.tasks or {}),
+						"sections:",
+						#(final_result.data.sections or {})
+					)
 				end
 
 				callback({

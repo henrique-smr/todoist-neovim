@@ -1,346 +1,174 @@
--- Todoist.nvim - A Neovim plugin for Todoist integration with markdown
--- Author: AI Assistant
--- License: MIT
-
+-- Main plugin entry point
 local M = {}
 
--- Load modules
 local config = require("todoist.config")
-local api = require("todoist.api")
-local parser = require("todoist.parser")
-local sync = require("todoist.sync")
-local ui = require("todoist.ui")
 
--- Internal state
-local projects = {}
-local current_project = nil
-local sync_timer = nil
-local ns_id = vim.api.nvim_create_namespace("todoist")
-
--- Setup function
 function M.setup(opts)
+	opts = opts or {}
+
+	-- Setup configuration and validate
 	config.setup(opts)
 
-	if not config.is_valid(config.get_token()) then
-		vim.notify("Todoist API token not provided. Please set it in your config.", vim.log.levels.ERROR)
-		return
+	-- Only load other modules after successful config
+	local api = require("todoist.api")
+
+	if config.is_debug() then
+		print("DEBUG: Todoist.nvim plugin setup completed successfully")
 	end
 
 	api.set_token(config.get_token())
 
-	-- Create user commands
-	vim.api.nvim_create_user_command("TodoistProjects", M.list_projects, {})
-	vim.api.nvim_create_user_command("TodoistCreateProject", function(opts)
-		M.create_project(opts.args)
-	end, { nargs = 1 })
-	vim.api.nvim_create_user_command("TodoistOpen", function(opts)
-		M.open_project(opts.args)
-	end, { nargs = 1, complete = M.complete_projects })
-	vim.api.nvim_create_user_command("TodoistSync", M.sync_current_buffer, {})
-	vim.api.nvim_create_user_command("TodoistToggle", M.toggle_task, {})
+	-- Setup commands after successful configuration
+	M.setup_commands()
 
-	-- Create autocommands
-	local augroup = vim.api.nvim_create_augroup("TodoistNvim", { clear = true })
-
-	vim.api.nvim_create_autocmd("BufWritePost", {
-		group = augroup,
-		pattern = "*.todoist.md",
-		callback = function()
-			if config.get_auto_sync() then
-				M.sync_current_buffer()
-			end
-		end,
-	})
-
-	-- Set up auto-sync timer
-	if config.get_auto_sync() then
-		M.start_auto_sync()
-	end
-
-	-- Key mappings for todoist buffers
-	vim.api.nvim_create_autocmd("FileType", {
-		group = augroup,
-		pattern = "markdown",
-		callback = function()
-			local bufname = vim.api.nvim_buf_get_name(0)
-			if bufname:match("%.todoist%.md$") then
-				vim.keymap.set({ "n", "i" }, "<C-t>", M.toggle_task, { buffer = true })
-				vim.keymap.set("n", "<leader>ts", M.sync_current_buffer, { buffer = true })
-			end
-		end,
-	})
-
-	if config.is_debug() then
-		print("DEBUG: Todoist.nvim setup completed")
-	end
+	return true
 end
 
--- List all projects
-function M.list_projects()
+function M.select_project()
+	if config.is_debug() then
+		print("DEBUG: Starting project selection")
+	end
+
+	local api = require("todoist.api")
+
 	api.get_projects(function(result)
 		if result.error then
-			vim.notify("Error fetching projects: " .. result.error, vim.log.levels.ERROR)
+			vim.notify("Failed to fetch projects: " .. result.error, vim.log.levels.ERROR)
 			return
 		end
 
-		projects = result.data or {}
 		if config.is_debug() then
-			print("DEBUG: Fetched projects:", vim.inspect(projects))
+			print("DEBUG: Fetched projects:", vim.inspect(result.data))
 		end
-		ui.show_project_list(projects, M.open_project)
+
+		M.show_project_list(result.data)
 	end)
 end
 
--- Create a new project
-function M.create_project(name)
-	if not config.is_valid(name) or name == "" then
-		vim.ui.input({ prompt = "Project name: " }, function(input)
-			if config.is_valid(input) and input ~= "" then
-				M.create_project(input)
-			end
-		end)
-		return
-	end
-
-	api.create_project(name, function(result)
-		if result.error then
-			vim.notify("Error creating project: " .. result.error, vim.log.levels.ERROR)
-			return
-		end
-
-		vim.notify("Project '" .. name .. "' created successfully!", vim.log.levels.INFO)
-		M.list_projects() -- Refresh project list
-	end)
-end
-
--- Open a project as markdown
-function M.open_project(project_name)
-	local project = nil
-	for _, p in ipairs(projects) do
-		if config.is_valid(p.name) and p.name == project_name then
-			project = p
-			break
-		end
-	end
-
-	if not project then
-		vim.notify("Project not found: " .. project_name, vim.log.levels.ERROR)
-		return
-	end
-
-	current_project = project
-
+function M.show_project_list(projects)
 	if config.is_debug() then
-		print("DEBUG: Opening project:", vim.inspect(project))
+		print("DEBUG: Showing project list with", #projects, "projects")
 	end
 
-	-- Get project data with tasks and sections
-	api.get_project_data(project.id, function(result)
-		if result.error then
-			vim.notify("Error fetching project data: " .. result.error, vim.log.levels.ERROR)
-			return
+	-- Create project selection items
+	local items = {}
+	for _, project in ipairs(projects) do
+		if config.is_valid(project) and config.is_valid(project.name) then
+			table.insert(items, {
+				text = project.name,
+				data = project,
+			})
 		end
+	end
 
-		-- Add project info to the data
-		result.data.project = project
+	-- Show selection UI
+	vim.ui.select(items, {
+		prompt = "Select a Todoist project:",
+		format_item = function(item)
+			local icon = item.data.is_favorite and "⭐ " or "📋 "
+			return icon .. item.text
+		end,
+	}, function(selected)
+		if selected then
+			if config.is_debug() then
+				print("DEBUG: User selected project:", selected.data.name)
+				print("DEBUG: Opening project:", vim.inspect(selected.data))
+			end
 
-		if config.is_debug() then
-			print("DEBUG: Project data received:", vim.inspect(result.data))
+			-- Use buffer.lua to open the project
+			local buffer = require("todoist.buffer")
+			buffer.open_project(selected.data.id)
 		end
-
-		local filename = project.name:gsub("[^%w%s%-_]", "") .. ".todoist.md"
-		local filepath = vim.fn.expand("~/todoist/" .. filename)
-
-		-- Ensure directory exists
-		vim.fn.mkdir(vim.fn.fnamemodify(filepath, ":h"), "p")
-
-		-- Create buffer
-		local buf = vim.api.nvim_create_buf(false, false)
-		vim.api.nvim_buf_set_name(buf, filepath)
-
-		-- Generate markdown content
-		local content = parser.project_to_markdown(result.data)
-
-		if config.is_debug() then
-			print("DEBUG: Generated markdown lines:", vim.inspect(content.lines))
-			print("DEBUG: Generated extmarks count:", #content.extmarks)
-		end
-
-		vim.api.nvim_buf_set_lines(buf, 0, -1, false, content.lines)
-
-		-- Open buffer in current window first
-		vim.api.nvim_set_current_buf(buf)
-		vim.bo.filetype = "markdown"
-		vim.bo.modified = false
-
-		-- Set extmarks for tracking AFTER the buffer is current
-		vim.schedule(function()
-			parser.set_extmarks(buf, ns_id, content.extmarks)
-		end)
-
-		vim.notify("Opened project: " .. project.name, vim.log.levels.INFO)
 	end)
 end
 
--- Sync current buffer with Todoist
+-- Direct project opening function
+function M.open_project(project_id)
+	if not config.is_valid(project_id) then
+		vim.notify("Invalid project ID", vim.log.levels.ERROR)
+		return
+	end
+
+	local buffer = require("todoist.buffer")
+	buffer.open_project(project_id)
+end
+
+-- Utility functions for manual access
 function M.sync_current_buffer()
 	local buf = vim.api.nvim_get_current_buf()
-	local bufname = vim.api.nvim_buf_get_name(buf)
+	local buffer = require("todoist.buffer")
+	local buffer_info = buffer.buffers[buf]
 
-	if not bufname:match("%.todoist%.md$") then
-		vim.notify("Not a Todoist buffer", vim.log.levels.WARN)
-		return
+	if buffer_info then
+		buffer.sync_buffer(buf)
+	else
+		vim.notify("Current buffer is not a Todoist project", vim.log.levels.WARN)
 	end
-
-	if not current_project then
-		vim.notify("No current project", vim.log.levels.ERROR)
-		return
-	end
-
-	local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-	-- Use our custom function to get extmarks with data
-	local extmarks = parser.get_extmarks_with_data(buf, ns_id)
-
-	if config.is_debug() then
-		print("DEBUG: Syncing buffer with", #lines, "lines and", #extmarks, "extmarks")
-		if #extmarks > 0 then
-			print("DEBUG: First extmark data:", vim.inspect(extmarks[1][4]))
-		end
-	end
-
-	sync.sync_buffer_changes(current_project.id, lines, extmarks, function(result)
-		if result.error then
-			vim.notify("Sync error: " .. result.error, vim.log.levels.ERROR)
-			return
-		end
-
-		vim.notify("Synced successfully!", vim.log.levels.INFO)
-		vim.bo.modified = false
-
-		-- Update extmarks with newly created items
-		if result.data and result.data.created_items then
-			vim.schedule(function()
-				parser.update_extmarks_with_created_items(buf, ns_id, result.data.created_items)
-			end)
-		end
-	end)
 end
 
--- Toggle task completion
-function M.toggle_task()
+function M.refresh_current_buffer()
 	local buf = vim.api.nvim_get_current_buf()
-	local cursor = vim.api.nvim_win_get_cursor(0)
-	local line_num = cursor[1] - 1
+	local buffer = require("todoist.buffer")
+	local buffer_info = buffer.buffers[buf]
 
-	-- Use our custom function to get extmarks with data
-	local extmarks = parser.get_extmarks_with_data(buf, ns_id)
-
-	local task_extmark = nil
-	for _, mark in ipairs(extmarks) do
-		local mark_line = mark[2]
-		local data = mark[4]
-		if config.is_valid(data) and data.type == "task" and math.abs(mark_line - line_num) <= 2 then
-			task_extmark = mark
-			break
-		end
-	end
-
-	if not task_extmark then
-		vim.notify("No task found on current line", vim.log.levels.WARN)
-		return
-	end
-
-	local task_id = task_extmark[4].id
-	local current_line = vim.api.nvim_buf_get_lines(buf, line_num, line_num + 1, false)[1]
-
-	-- Toggle checkbox in markdown
-	local new_line
-	if current_line:match("%- %[ %]") then
-		new_line = current_line:gsub("%- %[ %]", "- [x]")
-	elseif current_line:match("%- %[x%]") then
-		new_line = current_line:gsub("%- %[x%]", "- [ ]")
+	if buffer_info then
+		buffer.refresh_buffer(buf)
 	else
-		vim.notify("Current line is not a task", vim.log.levels.WARN)
-		return
+		vim.notify("Current buffer is not a Todoist project", vim.log.levels.WARN)
 	end
+end
 
-	-- Update buffer
-	vim.api.nvim_buf_set_lines(buf, line_num, line_num + 1, false, { new_line })
+-- Debug function to check configuration
+function M.debug_config()
+	print("=== Todoist Configuration Debug ===")
+	print("API Token:", config.get_token() and "SET" or "NOT SET")
+	print("Debug mode:", config.is_debug())
+	print("Config:", vim.inspect(config.get_config()))
 
-	-- Get current task state from our extmark to avoid redundant API calls
-	local current_completed = task_extmark[4].completed
-	local new_completed = new_line:match("%- %[x%]") ~= nil
-
-	if config.is_debug() then
-		print("DEBUG: Toggle task - current completed:", current_completed, "new completed:", new_completed)
-	end
-
-	-- Only sync if the state actually changed
-	if current_completed ~= new_completed then
-		api.toggle_task(task_id, new_completed, function(result)
+	-- Test API connection
+	if config.get_token() then
+		local api = require("todoist.api")
+		api.get_projects(function(result)
 			if result.error then
-				vim.notify("Error toggling task: " .. result.error, vim.log.levels.ERROR)
-				-- Revert the change
-				vim.api.nvim_buf_set_lines(buf, line_num, line_num + 1, false, { current_line })
+				print("API Test FAILED:", result.error)
 			else
-				vim.notify("Task " .. (new_completed and "completed" or "reopened"), vim.log.levels.INFO)
-
-				-- Update our stored extmark data to reflect the new state
-				local extmark_data_store = parser.get_extmark_data_store()
-				if extmark_data_store[buf] and extmark_data_store[buf][task_extmark[1]] then
-					extmark_data_store[buf][task_extmark[1]].completed = new_completed
-				end
+				print("API Test SUCCESS: Found", #result.data, "projects")
 			end
 		end)
 	else
-		if config.is_debug() then
-			print("DEBUG: No state change needed, skipping API call")
+		print("Cannot test API - no token configured")
+	end
+end
+
+-- Setup commands
+function M.setup_commands()
+	vim.api.nvim_create_user_command("TodoistProjects", M.select_project, {
+		desc = "Open Todoist project selector",
+	})
+
+	vim.api.nvim_create_user_command("TodoistSync", M.sync_current_buffer, {
+		desc = "Sync current Todoist buffer",
+	})
+
+	vim.api.nvim_create_user_command("TodoistRefresh", M.refresh_current_buffer, {
+		desc = "Refresh current Todoist buffer from server",
+	})
+
+	vim.api.nvim_create_user_command("TodoistOpen", function(opts)
+		local project_id = opts.args
+		if project_id and project_id ~= "" then
+			M.open_project(project_id)
+		else
+			vim.notify("Usage: :TodoistOpen <project_id>", vim.log.levels.ERROR)
 		end
-	end
-end
+	end, {
+		nargs = 1,
+		desc = "Open specific Todoist project by ID",
+	})
 
--- Auto-sync functionality
-function M.start_auto_sync()
-	if sync_timer then
-		vim.loop.timer_stop(sync_timer)
-	end
-
-	sync_timer = vim.loop.new_timer()
-	sync_timer:start(
-		config.get_sync_interval(),
-		config.get_sync_interval(),
-		vim.schedule_wrap(function()
-			local buf = vim.api.nvim_get_current_buf()
-			local bufname = vim.api.nvim_buf_get_name(buf)
-
-			if bufname:match("%.todoist%.md$") and not vim.bo.modified then
-				M.sync_current_buffer()
-			end
-		end)
-	)
-end
-
-function M.stop_auto_sync()
-	if sync_timer then
-		vim.loop.timer_stop(sync_timer)
-		sync_timer = nil
-	end
-end
-
--- Completion function for project names
-function M.complete_projects(arg_lead, cmd_line, cursor_pos)
-	local matches = {}
-	for _, project in ipairs(projects) do
-		if config.is_valid(project.name) and project.name:lower():find(arg_lead:lower(), 1, true) then
-			table.insert(matches, project.name)
-		end
-	end
-	return matches
-end
-
--- Get namespace ID (for external access)
-function M.get_namespace_id()
-	return ns_id
+	vim.api.nvim_create_user_command("TodoistDebug", M.debug_config, {
+		desc = "Debug Todoist configuration and API connection",
+	})
 end
 
 return M

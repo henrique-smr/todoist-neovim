@@ -15,17 +15,27 @@ function M.open_project(project_id)
 		return
 	end
 
+	if config.is_debug() then
+		print("DEBUG: Opening project with buffer.lua:", project_id)
+	end
+
 	-- Create or focus existing buffer for this project
 	local buf_name = "todoist://project/" .. project_id
 	local existing_buf = vim.fn.bufnr(buf_name)
 
 	if existing_buf ~= -1 then
-		-- Buffer exists, switch to it
-		local win = vim.fn.bufwinid(existing_buf)
-		if win ~= -1 then
-			vim.api.nvim_set_current_win(win)
+		-- Buffer exists, check if it's in a tab
+		local existing_tab = M.find_buffer_tab(existing_buf)
+		if existing_tab then
+			vim.api.nvim_set_current_tabpage(existing_tab)
+			local win = vim.fn.bufwinid(existing_buf)
+			if win ~= -1 then
+				vim.api.nvim_set_current_win(win)
+			end
 		else
-			vim.cmd("buffer " .. existing_buf)
+			-- Open in new tab
+			vim.cmd("tabnew")
+			vim.api.nvim_set_current_buf(existing_buf)
 		end
 		return existing_buf
 	end
@@ -43,15 +53,160 @@ function M.open_project(project_id)
 		last_sync = 0,
 	}
 
-	-- Set up buffer
+	-- Open in new tab
+	vim.cmd("tabnew")
 	vim.api.nvim_set_current_buf(buf)
+
+	-- Set up buffer
 	M.setup_buffer_autocmds(buf)
 	M.setup_buffer_keymaps(buf)
 
 	-- Load project data
 	M.load_project_data(buf, project_id)
 
+	if config.is_debug() then
+		print("DEBUG: Created new Todoist buffer:", buf, "in new tab")
+	end
+
 	return buf
+end
+
+function M.find_buffer_tab(buf)
+	for i = 1, vim.fn.tabpagenr("$") do
+		local tab_buffers = vim.fn.tabpagebuflist(i)
+		for _, tab_buf in ipairs(tab_buffers) do
+			if tab_buf == buf then
+				return i
+			end
+		end
+	end
+	return nil
+end
+
+function M.close_buffer_and_tab(buf)
+	local tab = M.find_buffer_tab(buf)
+	if tab then
+		-- Store current tab to switch back after closing
+		local current_tab = vim.fn.tabpagenr()
+
+		if tab == current_tab then
+			-- We're in the tab we want to close
+			if vim.fn.tabpagenr("$") > 1 then
+				vim.cmd("tabclose")
+			else
+				-- Last tab, just close the buffer
+				vim.cmd("bdelete " .. buf)
+			end
+		else
+			-- Switch to tab and close it
+			vim.api.nvim_set_current_tabpage(tab)
+			if vim.fn.tabpagenr("$") > 1 then
+				vim.cmd("tabclose")
+			else
+				vim.cmd("bdelete " .. buf)
+			end
+			-- Switch back to original tab if it still exists
+			if current_tab <= vim.fn.tabpagenr("$") then
+				vim.api.nvim_set_current_tabpage(current_tab)
+			end
+		end
+	else
+		-- Buffer not in a tab, just delete it
+		vim.cmd("bdelete " .. buf)
+	end
+
+	-- Clean up buffer tracking
+	M.buffers[buf] = nil
+
+	if config.is_debug() then
+		print("DEBUG: Closed Todoist buffer and tab:", buf)
+	end
+end
+
+function M.find_task_positions(buf)
+	local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+	local task_positions = {}
+
+	for i, line in ipairs(lines) do
+		-- Match task lines: "  - [ ] Task" or "  - [x] Task"
+		local indent, checkbox = line:match("^(%s*)%- %[([%sx])%]")
+		if checkbox then
+			-- Calculate position between the brackets
+			local bracket_pos = #indent + 3 -- Position after "- ["
+			table.insert(task_positions, {
+				line = i - 1, -- Convert to 0-indexed
+				col = bracket_pos,
+				completed = checkbox == "x",
+			})
+		end
+	end
+
+	return task_positions
+end
+
+function M.navigate_to_task(buf, direction)
+	local task_positions = M.find_task_positions(buf)
+	if #task_positions == 0 then
+		return
+	end
+
+	local cursor = vim.api.nvim_win_get_cursor(0)
+	local current_line = cursor[1] - 1 -- Convert to 0-indexed
+	local current_col = cursor[2]
+
+	local current_idx = nil
+
+	-- Find current task position
+	for i, pos in ipairs(task_positions) do
+		if pos.line == current_line then
+			current_idx = i
+			break
+		end
+	end
+
+	local target_idx
+	if current_idx then
+		-- We're on a task line, move to next/previous
+		if direction == "next" then
+			target_idx = current_idx < #task_positions and current_idx + 1 or 1
+		else
+			target_idx = current_idx > 1 and current_idx - 1 or #task_positions
+		end
+	else
+		-- Not on a task line, find nearest task
+		if direction == "next" then
+			-- Find first task after current line
+			for i, pos in ipairs(task_positions) do
+				if pos.line > current_line then
+					target_idx = i
+					break
+				end
+			end
+			-- If no task after, go to first task
+			target_idx = target_idx or 1
+		else
+			-- Find last task before current line
+			for i = #task_positions, 1, -1 do
+				local pos = task_positions[i]
+				if pos.line < current_line then
+					target_idx = i
+					break
+				end
+			end
+			-- If no task before, go to last task
+			target_idx = target_idx or #task_positions
+		end
+	end
+
+	if target_idx then
+		local target_pos = task_positions[target_idx]
+		-- Position cursor between the brackets
+		vim.api.nvim_win_set_cursor(0, { target_pos.line + 1, target_pos.col })
+
+		if config.is_debug() then
+			print("DEBUG: Navigated to task at line", target_pos.line + 1, "col", target_pos.col)
+		end
+	end
 end
 
 function M.load_project_data(buf, project_id)
@@ -80,14 +235,28 @@ function M.render_project_data(buf, project_data)
 		return
 	end
 
+	-- Store cursor position
+	local cursor_pos = vim.api.nvim_win_get_cursor(0)
+
 	-- Convert project data to markdown
 	local markdown_data = parser.project_to_markdown(project_data)
+
+	-- Clear existing extmarks
+	vim.api.nvim_buf_clear_namespace(buf, M.namespace_id, 0, -1)
 
 	-- Set buffer content
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, markdown_data.lines)
 
 	-- Set extmarks
 	parser.set_extmarks(buf, M.namespace_id, markdown_data.extmarks)
+
+	-- Restore cursor position (with bounds checking)
+	local line_count = vim.api.nvim_buf_line_count(buf)
+	local target_line = math.min(cursor_pos[1], line_count)
+	local line_content = vim.api.nvim_buf_get_lines(buf, target_line - 1, target_line, false)[1] or ""
+	local target_col = math.min(cursor_pos[2], #line_content)
+
+	vim.api.nvim_win_set_cursor(0, { target_line, target_col })
 
 	-- Mark buffer as not modified
 	vim.api.nvim_buf_set_option(buf, "modified", false)
@@ -131,16 +300,30 @@ function M.sync_buffer(buf)
 
 			if config.is_debug() then
 				print("DEBUG: Sync completed successfully")
+				print("DEBUG: Has project_data:", result.data.project_data ~= nil)
+				print("DEBUG: Has created_items:", result.data.created_items ~= nil)
 			end
 
-			-- Update buffer with latest data
+			-- Always update buffer with latest data
 			if result.data.project_data then
+				if config.is_debug() then
+					print("DEBUG: Updating buffer with fresh project data")
+				end
 				M.render_project_data(buf, result.data.project_data)
 
 				-- Update extmarks for newly created items
-				if result.data.created_items then
+				if result.data.created_items and vim.tbl_count(result.data.created_items) > 0 then
+					if config.is_debug() then
+						print("DEBUG: Updating extmarks for", vim.tbl_count(result.data.created_items), "created items")
+					end
 					parser.update_extmarks_with_created_items(buf, M.namespace_id, result.data.created_items)
 				end
+			else
+				-- Fallback: reload project data if no project_data in result
+				if config.is_debug() then
+					print("DEBUG: No project_data in sync result, reloading...")
+				end
+				M.load_project_data(buf, project_id)
 			end
 
 			-- Update last sync time
@@ -190,6 +373,35 @@ function M.setup_buffer_keymaps(buf)
 	vim.keymap.set("n", "<leader>tr", function()
 		M.refresh_buffer(buf)
 	end, opts)
+
+	-- Task navigation
+	vim.keymap.set("n", "<Tab>", function()
+		M.navigate_to_task(buf, "next")
+	end, opts)
+
+	vim.keymap.set("n", "<S-Tab>", function()
+		M.navigate_to_task(buf, "prev")
+	end, opts)
+
+	-- Close buffer and tab with double ESC
+	local esc_timer = nil
+	vim.keymap.set("n", "<Esc>", function()
+		if esc_timer then
+			-- Second ESC press within timeout
+			vim.fn.timer_stop(esc_timer)
+			esc_timer = nil
+			M.close_buffer_and_tab(buf)
+		else
+			-- First ESC press, start timer
+			esc_timer = vim.fn.timer_start(500, function() -- 500ms timeout
+				esc_timer = nil
+			end)
+		end
+	end, opts)
+
+	if config.is_debug() then
+		print("DEBUG: Set up Todoist buffer keymaps for buffer", buf)
+	end
 end
 
 function M.refresh_buffer(buf)
