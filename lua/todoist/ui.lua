@@ -15,18 +15,24 @@ function M.show_project_list(projects, on_select)
 			end,
 		}, function(choice)
 			if choice then
-				on_select(choice)
+				vim.schedule(function()
+					on_select(choice)
+				end)
 			end
 		end)
 	end)
 end
 
 function M.show_error(message)
-	vim.notify(message, vim.log.levels.ERROR)
+	vim.schedule(function()
+		vim.notify(message, vim.log.levels.ERROR)
+	end)
 end
 
 function M.show_info(message)
-	vim.notify(message, vim.log.levels.INFO)
+	vim.schedule(function()
+		vim.notify(message, vim.log.levels.INFO)
+	end)
 end
 
 return M

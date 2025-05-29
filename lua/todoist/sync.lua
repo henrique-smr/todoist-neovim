@@ -64,9 +64,13 @@ function M.execute_sync_operations(project_id, changes, callback)
 		end
 
 		if has_error then
-			callback({ error = "Some sync operations failed" })
+			vim.schedule(function()
+				callback({ error = "Some sync operations failed" })
+			end)
 		else
-			callback({ data = { success = true } })
+			vim.schedule(function()
+				callback({ data = { success = true } })
+			end)
 		end
 	end)
 end
@@ -89,7 +93,9 @@ function M.execute_operations_sequence(operations, callback)
 	end
 
 	if #operations == 0 then
-		callback(results)
+		vim.schedule(function()
+			callback(results)
+		end)
 	else
 		execute_next()
 	end

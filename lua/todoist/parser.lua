@@ -6,8 +6,19 @@ function M.project_to_markdown(project_data)
 	local extmarks = {}
 
 	-- Add project title
-	table.insert(lines, "# " .. (project_data.name or "Untitled Project"))
+	local project_name = "Untitled Project"
+	if project_data.project and project_data.project.name then
+		project_name = project_data.project.name
+	end
+
+	table.insert(lines, "# " .. project_name)
 	table.insert(lines, "")
+
+	-- if M.config and M.config.debug then
+	print("DEBUG: Project data:", vim.inspect(project_data))
+	print("DEBUG: Tasks count:", #(project_data.tasks or {}))
+	print("DEBUG: Sections count:", #(project_data.sections or {}))
+	-- end
 
 	-- Group tasks by section
 	local sections = {}
@@ -27,8 +38,10 @@ function M.project_to_markdown(project_data)
 	for _, task in ipairs(project_data.tasks or {}) do
 		if task.section_id and sections[task.section_id] then
 			table.insert(sections[task.section_id].tasks, task)
+			print("DEBUG: Adding task to section:", task.content, "in section", sections[task.section_id].section.name)
 		else
 			table.insert(unsectioned_tasks, task)
+			print("DEBUG: Adding unsectioned task:", task.content)
 		end
 	end
 
@@ -60,6 +73,23 @@ function M.project_to_markdown(project_data)
 		end
 	end
 
+	-- If no tasks at all, add a helpful message
+	if #unsectioned_tasks == 0 and vim.tbl_count(sections) == 0 then
+		table.insert(lines, "_No tasks found. Start typing to add some!_")
+		table.insert(lines, "")
+		table.insert(lines, "## Example")
+		table.insert(lines, "")
+		table.insert(lines, "- [ ] Your first task")
+		table.insert(lines, "  Add task description here")
+		table.insert(lines, "")
+		table.insert(lines, "- [x] Completed task")
+	end
+
+	print("DEBUG: Final lines count:", #lines)
+	print("DEBUG: Final extmarks count:", #extmarks)
+	print("DEBUG: Lines content:", vim.inspect(lines))
+	print("DEBUG: Extmarks content:", vim.inspect(extmarks))
+
 	return {
 		lines = lines,
 		extmarks = extmarks,
@@ -81,6 +111,11 @@ function M.add_tasks_to_markdown(tasks, lines, extmarks, section_id)
 			table.insert(root_tasks, task)
 		end
 	end
+
+	-- Sort tasks by order if available
+	table.sort(root_tasks, function(a, b)
+		return (a.order or 0) < (b.order or 0)
+	end)
 
 	-- Add tasks recursively
 	for _, task in ipairs(root_tasks) do
@@ -118,6 +153,11 @@ function M.add_task_to_markdown(task, lines, extmarks, depth, task_children)
 
 	-- Add children
 	if task_children[task.id] then
+		-- Sort children by order
+		table.sort(task_children[task.id], function(a, b)
+			return (a.order or 0) < (b.order or 0)
+		end)
+
 		for _, child in ipairs(task_children[task.id]) do
 			M.add_task_to_markdown(child, lines, extmarks, depth + 1, task_children)
 		end
@@ -126,7 +166,9 @@ end
 
 function M.set_extmarks(buf, ns_id, extmarks)
 	for _, mark in ipairs(extmarks) do
-		vim.api.nvim_buf_set_extmark(buf, ns_id, mark.line, mark.col, mark.opts)
+		pcall(function()
+			vim.api.nvim_buf_set_extmark(buf, ns_id, mark.line, mark.col, mark.opts)
+		end)
 	end
 end
 

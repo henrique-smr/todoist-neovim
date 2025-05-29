@@ -13,7 +13,9 @@ end
 
 local function make_request(method, endpoint, data, callback)
 	if not M.token then
-		callback({ error = "API token not set" })
+		vim.schedule(function()
+			callback({ error = "API token not set" })
+		end)
 		return
 	end
 
@@ -28,16 +30,18 @@ local function make_request(method, endpoint, data, callback)
 		url = url,
 		headers = headers,
 		callback = function(response)
-			if response.status >= 200 and response.status < 300 then
-				local success, data = pcall(json.decode, response.body)
-				if success then
-					callback({ data = data })
+			vim.schedule(function()
+				if response.status >= 200 and response.status < 300 then
+					local success, data = pcall(json.decode, response.body)
+					if success then
+						callback({ data = data })
+					else
+						callback({ error = "Failed to parse JSON response: " .. (response.body or "") })
+					end
 				else
-					callback({ error = "Failed to parse JSON response" })
+					callback({ error = "HTTP " .. response.status .. ": " .. (response.body or "Unknown error") })
 				end
-			else
-				callback({ error = "HTTP " .. response.status .. ": " .. (response.body or "Unknown error") })
-			end
+			end)
 		end,
 	}
 
@@ -57,28 +61,33 @@ function M.create_project(name, callback)
 end
 
 function M.get_project_data(project_id, callback)
-	local scheduled_callback = vim.schedule_wrap(callback)
 	-- Get tasks for the project
 	make_request("GET", "/tasks?project_id=" .. project_id, nil, function(tasks_result)
 		if tasks_result.error then
-			scheduled_callback(tasks_result)
+			vim.schedule(function()
+				callback(tasks_result)
+			end)
 			return
 		end
 
 		-- Get sections for the project
 		make_request("GET", "/sections?project_id=" .. project_id, nil, function(sections_result)
 			if sections_result.error then
-				scheduled_callback(sections_result)
+				vim.schedule(function()
+					callback(sections_result)
+				end)
 				return
 			end
 
-			scheduled_callback({
-				data = {
-					project_id = project_id,
-					tasks = tasks_result.data or {},
-					sections = sections_result.data or {},
-				},
-			})
+			vim.schedule(function()
+				callback({
+					data = {
+						project_id = project_id,
+						tasks = tasks_result.data or {},
+						sections = sections_result.data or {},
+					},
+				})
+			end)
 		end)
 	end)
 end

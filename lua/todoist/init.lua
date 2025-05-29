@@ -137,6 +137,9 @@ function M.open_project(project_name)
 			return
 		end
 
+		-- Add project info to the data
+		result.data.project = project
+
 		local filename = project.name:gsub("[^%w%s%-_]", "") .. ".todoist.md"
 		local filepath = vim.fn.expand("~/todoist/" .. filename)
 
