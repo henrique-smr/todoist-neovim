@@ -125,18 +125,6 @@ function M.project_to_markdown(project_data)
 		end
 	end
 
-	-- If no content at all, add a helpful message
-	if #unsectioned_tasks == 0 and #sections == 0 then
-		table.insert(lines, "_No tasks found. Start typing to add some!_")
-		table.insert(lines, "")
-		table.insert(lines, "## Example")
-		table.insert(lines, "")
-		table.insert(lines, "- [ ] Your first task")
-		table.insert(lines, "  Add task description here")
-		table.insert(lines, "")
-		table.insert(lines, "- [x] Completed task")
-	end
-
 	if config.is_debug() then
 		print("DEBUG: Final lines count:", #lines)
 		print("DEBUG: Final extmarks count:", #extmarks)

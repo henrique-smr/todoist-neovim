@@ -6,14 +6,428 @@ local parser = require("todoist.parser")
 local config = require("todoist.config")
 
 function M.sync_buffer_changes(project_id, lines, extmarks, callback)
-	local changes = parser.parse_markdown_to_changes(lines, extmarks)
-
 	if config.is_debug() then
-		print("DEBUG: Sync changes:", vim.inspect(changes))
+		print("DEBUG: Starting bidirectional sync for project:", project_id)
 	end
 
-	-- Execute changes in order: deletes, updates, creates
-	M.execute_sync_operations(project_id, changes, lines, extmarks, callback)
+	-- Step 1: Get current state from Todoist
+	api.get_project_data(project_id, function(remote_result)
+		if remote_result.error then
+			callback(remote_result)
+			return
+		end
+
+		if config.is_debug() then
+			print(
+				"DEBUG: Fetched remote data - tasks:",
+				#(remote_result.data.tasks or {}),
+				"sections:",
+				#(remote_result.data.sections or {})
+			)
+		end
+
+		-- Step 2: Parse local changes
+		local local_changes = parser.parse_markdown_to_changes(lines, extmarks)
+
+		if config.is_debug() then
+			print("DEBUG: Local changes:", vim.inspect(local_changes))
+		end
+
+		-- Step 3: Detect remote changes by comparing with extmarks
+		local remote_changes = M.detect_remote_changes(remote_result.data, extmarks)
+
+		if config.is_debug() then
+			print("DEBUG: Remote changes:", vim.inspect(remote_changes))
+		end
+
+		-- Step 4: Merge and resolve conflicts
+		local merged_changes = M.merge_changes(local_changes, remote_changes, remote_result.data)
+
+		if config.is_debug() then
+			print("DEBUG: Merged changes:", vim.inspect(merged_changes))
+		end
+
+		-- Step 5: Apply changes and return updated data
+		M.execute_sync_operations(project_id, merged_changes, lines, extmarks, function(sync_result)
+			if sync_result.error then
+				callback(sync_result)
+				return
+			end
+
+			-- Step 6: Fetch final state and return for rendering
+			api.get_project_data(project_id, function(final_result)
+				if final_result.error then
+					callback(final_result)
+					return
+				end
+
+				callback({
+					data = {
+						success = true,
+						project_data = final_result.data,
+						created_items = sync_result.data.created_items or {},
+					},
+				})
+			end)
+		end)
+	end)
+end
+
+-- Detect changes made remotely (in Todoist web/app) since last sync
+function M.detect_remote_changes(remote_data, extmarks)
+	local changes = {
+		remote_updates = {},
+		remote_creates = {},
+		remote_deletes = {},
+	}
+
+	-- Build lookup of local items from extmarks
+	local local_items = {}
+	for _, mark in ipairs(extmarks) do
+		local data = mark[4]
+		if config.is_valid(data) and config.is_valid(data.id) then
+			local_items[data.id] = data
+		end
+	end
+
+	if config.is_debug() then
+		print("DEBUG: Local items from extmarks:", vim.tbl_count(local_items))
+		print("DEBUG: Local item IDs:", vim.inspect(vim.tbl_keys(local_items)))
+	end
+
+	-- Check remote tasks for changes/additions
+	for _, remote_task in ipairs(remote_data.tasks or {}) do
+		if config.is_valid(remote_task) and config.is_valid(remote_task.id) then
+			local task_id = tostring(remote_task.id)
+			local local_task = local_items[task_id]
+
+			if local_task then
+				-- Task exists locally - check for remote updates
+				local content_changed = local_task.content ~= (remote_task.content or "")
+				local description_changed = (local_task.description or "") ~= (remote_task.description or "")
+				local completion_changed = local_task.completed ~= (remote_task.is_completed or false)
+
+				if content_changed or description_changed or completion_changed then
+					table.insert(changes.remote_updates, {
+						type = "task",
+						id = task_id,
+						remote_data = remote_task,
+						local_data = local_task,
+					})
+
+					if config.is_debug() then
+						print("DEBUG: Remote task update detected:", task_id)
+						if content_changed then
+							print(
+								"  Content: local='"
+									.. (local_task.content or "")
+									.. "' remote='"
+									.. (remote_task.content or "")
+									.. "'"
+							)
+						end
+						if description_changed then
+							print(
+								"  Description: local='"
+									.. (local_task.description or "")
+									.. "' remote='"
+									.. (remote_task.description or "")
+									.. "'"
+							)
+						end
+						if completion_changed then
+							print(
+								"  Completion: local="
+									.. tostring(local_task.completed)
+									.. " remote="
+									.. tostring(remote_task.is_completed or false)
+							)
+						end
+					end
+				end
+			else
+				-- Task doesn't exist locally - remote addition
+				table.insert(changes.remote_creates, {
+					type = "task",
+					data = remote_task,
+				})
+
+				if config.is_debug() then
+					print("DEBUG: Remote task creation detected:", task_id, remote_task.content)
+				end
+			end
+		end
+	end
+
+	-- Check remote sections for changes/additions
+	for _, remote_section in ipairs(remote_data.sections or {}) do
+		if config.is_valid(remote_section) and config.is_valid(remote_section.id) then
+			local section_id = tostring(remote_section.id)
+			local local_section = local_items[section_id]
+
+			if local_section then
+				-- Section exists locally - check for remote updates
+				if local_section.name ~= (remote_section.name or "") then
+					table.insert(changes.remote_updates, {
+						type = "section",
+						id = section_id,
+						remote_data = remote_section,
+						local_data = local_section,
+					})
+
+					if config.is_debug() then
+						print("DEBUG: Remote section update detected:", section_id)
+						print(
+							"  Name: local='"
+								.. (local_section.name or "")
+								.. "' remote='"
+								.. (remote_section.name or "")
+								.. "'"
+						)
+					end
+				end
+			else
+				-- Section doesn't exist locally - remote addition
+				table.insert(changes.remote_creates, {
+					type = "section",
+					data = remote_section,
+				})
+
+				if config.is_debug() then
+					print("DEBUG: Remote section creation detected:", section_id, remote_section.name)
+				end
+			end
+		end
+	end
+
+	-- Check for remote deletions (local items not in remote)
+	local remote_items = {}
+	for _, task in ipairs(remote_data.tasks or {}) do
+		if config.is_valid(task) and config.is_valid(task.id) then
+			remote_items[tostring(task.id)] = true
+		end
+	end
+	for _, section in ipairs(remote_data.sections or {}) do
+		if config.is_valid(section) and config.is_valid(section.id) then
+			remote_items[tostring(section.id)] = true
+		end
+	end
+
+	for item_id, local_data in pairs(local_items) do
+		if not remote_items[item_id] then
+			table.insert(changes.remote_deletes, {
+				type = local_data.type,
+				id = item_id,
+				local_data = local_data,
+			})
+
+			if config.is_debug() then
+				print("DEBUG: Remote deletion detected:", item_id, local_data.type)
+			end
+		end
+	end
+
+	return changes
+end
+
+-- Merge local and remote changes, resolving conflicts
+function M.merge_changes(local_changes, remote_changes, remote_data)
+	local merged = {
+		created_sections = {},
+		updated_sections = {},
+		deleted_sections = {},
+		created_tasks = {},
+		updated_tasks = {},
+		deleted_tasks = {},
+		accept_remote_updates = {},
+		accept_remote_creates = {},
+		accept_remote_deletes = {},
+	}
+
+	-- Build lookup of local changes by ID
+	local local_updates_by_id = {}
+	local local_deletes_by_id = {}
+
+	for _, update in ipairs(local_changes.updated_tasks) do
+		if config.is_valid(update.id) then
+			local_updates_by_id[update.id] = update
+		end
+	end
+	for _, update in ipairs(local_changes.updated_sections) do
+		if config.is_valid(update.id) then
+			local_updates_by_id[update.id] = update
+		end
+	end
+	for _, delete_id in ipairs(local_changes.deleted_tasks) do
+		local_deletes_by_id[delete_id] = "task"
+	end
+	for _, delete_id in ipairs(local_changes.deleted_sections) do
+		local_deletes_by_id[delete_id] = "section"
+	end
+
+	-- Handle remote updates with conflict resolution
+	for _, remote_update in ipairs(remote_changes.remote_updates) do
+		local item_id = remote_update.id
+		local local_update = local_updates_by_id[item_id]
+		local local_delete = local_deletes_by_id[item_id]
+
+		if local_delete then
+			-- Conflict: local delete vs remote update
+			-- Resolution: Prefer local delete (user intention)
+			if remote_update.type == "task" then
+				table.insert(merged.deleted_tasks, item_id)
+			else
+				table.insert(merged.deleted_sections, item_id)
+			end
+
+			if config.is_debug() then
+				print("DEBUG: Conflict resolved - local delete wins over remote update:", item_id)
+			end
+		elseif local_update then
+			-- Conflict: local update vs remote update
+			-- Resolution: Prefer local update (user intention)
+			if remote_update.type == "task" then
+				table.insert(merged.updated_tasks, local_update)
+			else
+				table.insert(merged.updated_sections, local_update)
+			end
+
+			if config.is_debug() then
+				print("DEBUG: Conflict resolved - local update wins over remote update:", item_id)
+			end
+		else
+			-- No conflict: accept remote update
+			table.insert(merged.accept_remote_updates, remote_update)
+
+			if config.is_debug() then
+				print("DEBUG: Accepting remote update:", item_id)
+			end
+		end
+	end
+
+	-- Handle remote creates (no conflicts possible)
+	for _, remote_create in ipairs(remote_changes.remote_creates) do
+		table.insert(merged.accept_remote_creates, remote_create)
+
+		if config.is_debug() then
+			print("DEBUG: Accepting remote create:", remote_create.data.id or "no-id")
+		end
+	end
+
+	-- Handle remote deletes with conflict resolution
+	for _, remote_delete in ipairs(remote_changes.remote_deletes) do
+		local item_id = remote_delete.id
+		local local_update = local_updates_by_id[item_id]
+
+		if local_update then
+			-- Conflict: local update vs remote delete
+			-- Resolution: Prefer local update (recreate item)
+			if remote_delete.type == "task" then
+				table.insert(merged.created_tasks, {
+					content = local_update.content,
+					description = local_update.description or "",
+					is_completed = local_update.is_completed or false,
+					depth = 0, -- Will be determined by sync logic
+					line = -1, -- Will be determined by sync logic
+				})
+			else
+				table.insert(merged.created_sections, {
+					name = local_update.name,
+					line = -1, -- Will be determined by sync logic
+				})
+			end
+
+			if config.is_debug() then
+				print("DEBUG: Conflict resolved - local update wins over remote delete, recreating:", item_id)
+			end
+		else
+			-- No conflict: accept remote delete
+			table.insert(merged.accept_remote_deletes, remote_delete)
+
+			if config.is_debug() then
+				print("DEBUG: Accepting remote delete:", item_id)
+			end
+		end
+	end
+
+	-- Add local-only changes (creates, updates, deletes without conflicts)
+	for _, create in ipairs(local_changes.created_sections) do
+		table.insert(merged.created_sections, create)
+	end
+	for _, create in ipairs(local_changes.created_tasks) do
+		table.insert(merged.created_tasks, create)
+	end
+
+	-- Add updates and deletes that weren't conflicted
+	for _, update in ipairs(local_changes.updated_tasks) do
+		if config.is_valid(update.id) then
+			local found_conflict = false
+			for _, remote_update in ipairs(remote_changes.remote_updates) do
+				if remote_update.id == update.id then
+					found_conflict = true
+					break
+				end
+			end
+			for _, remote_delete in ipairs(remote_changes.remote_deletes) do
+				if remote_delete.id == update.id then
+					found_conflict = true
+					break
+				end
+			end
+			if not found_conflict then
+				table.insert(merged.updated_tasks, update)
+			end
+		end
+	end
+
+	for _, update in ipairs(local_changes.updated_sections) do
+		if config.is_valid(update.id) then
+			local found_conflict = false
+			for _, remote_update in ipairs(remote_changes.remote_updates) do
+				if remote_update.id == update.id then
+					found_conflict = true
+					break
+				end
+			end
+			for _, remote_delete in ipairs(remote_changes.remote_deletes) do
+				if remote_delete.id == update.id then
+					found_conflict = true
+					break
+				end
+			end
+			if not found_conflict then
+				table.insert(merged.updated_sections, update)
+			end
+		end
+	end
+
+	for _, delete_id in ipairs(local_changes.deleted_tasks) do
+		local found_conflict = false
+		for _, remote_update in ipairs(remote_changes.remote_updates) do
+			if remote_update.id == delete_id then
+				found_conflict = true
+				break
+			end
+		end
+		if not found_conflict then
+			table.insert(merged.deleted_tasks, delete_id)
+		end
+	end
+
+	for _, delete_id in ipairs(local_changes.deleted_sections) do
+		local found_conflict = false
+		for _, remote_update in ipairs(remote_changes.remote_updates) do
+			if remote_update.id == delete_id then
+				found_conflict = true
+				break
+			end
+		end
+		if not found_conflict then
+			table.insert(merged.deleted_sections, delete_id)
+		end
+	end
+
+	return merged
 end
 
 function M.execute_sync_operations(project_id, changes, lines, extmarks, callback)
@@ -34,6 +448,9 @@ function M.execute_sync_operations(project_id, changes, lines, extmarks, callbac
 			end
 		end
 	end
+
+	-- Note: Remote changes are already reflected in the final project data fetch
+	-- We only need to apply local changes here
 
 	-- Delete operations first
 	for _, task_id in ipairs(changes.deleted_tasks) do
