@@ -13,12 +13,27 @@ function M.sync_buffer_changes(project_id, lines, extmarks, callback)
 	end
 
 	-- Execute changes in order: deletes, updates, creates
-	M.execute_sync_operations(project_id, changes, lines, callback)
+	M.execute_sync_operations(project_id, changes, lines, extmarks, callback)
 end
 
-function M.execute_sync_operations(project_id, changes, lines, callback)
+function M.execute_sync_operations(project_id, changes, lines, extmarks, callback)
 	local operations = {}
 	local created_items = {} -- Track items created during sync
+	local section_id_mappings = {} -- Map line numbers to section IDs
+	local task_id_mappings = {} -- Map line numbers to task IDs
+
+	-- Build extmark lookup for existing sections
+	local existing_sections_by_line = {}
+	for _, mark in ipairs(extmarks) do
+		local line_num = mark[2]
+		local data = mark[4]
+		if config.is_valid(data) and data.type == "section" then
+			existing_sections_by_line[line_num] = data.id
+			if config.is_debug() then
+				print("DEBUG: Found existing section at line", line_num, "ID:", data.id)
+			end
+		end
+	end
 
 	-- Delete operations first
 	for _, task_id in ipairs(changes.deleted_tasks) do
@@ -143,12 +158,12 @@ function M.execute_sync_operations(project_id, changes, lines, callback)
 		end
 	end
 
-	-- Create operations with tracking
+	-- Create sections first and track their IDs
 	for _, section in ipairs(changes.created_sections) do
 		if config.is_valid(section) and config.is_valid(section.name) then
 			table.insert(operations, function(cb)
 				if config.is_debug() then
-					print("DEBUG: Creating section:", section.name)
+					print("DEBUG: Creating section:", section.name, "at line:", section.line)
 				end
 				api.create_section(project_id, section.name, function(result)
 					if not result.error and result.data and result.data.id then
@@ -158,8 +173,10 @@ function M.execute_sync_operations(project_id, changes, lines, callback)
 							id = tostring(result.data.id),
 							name = section.name,
 						}
+						-- Map section line to section ID for task creation
+						section_id_mappings[section.line] = tostring(result.data.id)
 						if config.is_debug() then
-							print("DEBUG: Section created with ID:", result.data.id)
+							print("DEBUG: Section created with ID:", result.data.id, "at line:", section.line)
 						end
 					end
 					cb(result)
@@ -168,24 +185,152 @@ function M.execute_sync_operations(project_id, changes, lines, callback)
 		end
 	end
 
+	-- Helper function to find the section for a task
+	local function find_section_for_task(task_line, lines)
+		-- Look backwards from the task line to find the most recent section
+		for i = task_line, 1, -1 do
+			local line = lines[i]
+			if line and line:match("^## (.+)$") then
+				if config.is_debug() then
+					print("DEBUG: Found section at line", i, "for task at line", task_line)
+				end
+
+				-- Check if this section was newly created
+				if section_id_mappings[i - 1] then -- -1 because line numbers are 0-indexed
+					if config.is_debug() then
+						print("DEBUG: Using newly created section ID:", section_id_mappings[i - 1])
+					end
+					return section_id_mappings[i - 1]
+				end
+
+				-- Check if this is an existing section
+				if existing_sections_by_line[i - 1] then -- -1 because line numbers are 0-indexed
+					if config.is_debug() then
+						print("DEBUG: Using existing section ID:", existing_sections_by_line[i - 1])
+					end
+					return existing_sections_by_line[i - 1]
+				end
+
+				break
+			end
+		end
+		return nil
+	end
+
+	-- Helper function to find the parent task for a subtask
+	local function find_parent_for_task(task_line, task_depth, lines, created_tasks_by_line, existing_tasks_by_line)
+		if task_depth == 0 then
+			return nil -- Root task
+		end
+
+		local target_depth = task_depth - 1
+
+		-- Look backwards from the task line to find a task at the target depth
+		for i = task_line, 1, -1 do
+			local line = lines[i]
+			if line and line:match("^(%s*)%- %[([%sx])%] (.+)$") then
+				local indent_str = line:match("^(%s*)")
+				local line_depth = M.calculate_effective_depth(indent_str)
+
+				if line_depth == target_depth then
+					if config.is_debug() then
+						print(
+							"DEBUG: Found potential parent at line",
+							i,
+							"depth",
+							line_depth,
+							"for task at line",
+							task_line,
+							"depth",
+							task_depth
+						)
+					end
+
+					-- Check if this parent was newly created in this sync
+					if created_tasks_by_line[i - 1] then -- -1 because line numbers are 0-indexed
+						if config.is_debug() then
+							print("DEBUG: Using newly created parent ID:", created_tasks_by_line[i - 1])
+						end
+						return created_tasks_by_line[i - 1]
+					end
+
+					-- Check if this is an existing task
+					if existing_tasks_by_line[i - 1] then -- -1 because line numbers are 0-indexed
+						if config.is_debug() then
+							print("DEBUG: Using existing parent ID:", existing_tasks_by_line[i - 1])
+						end
+						return existing_tasks_by_line[i - 1]
+					end
+
+					break
+				end
+			end
+		end
+		return nil
+	end
+
+	-- Build extmark lookup for existing tasks
+	local existing_tasks_by_line = {}
+	for _, mark in ipairs(extmarks) do
+		local line_num = mark[2]
+		local data = mark[4]
+		if config.is_valid(data) and data.type == "task" then
+			existing_tasks_by_line[line_num] = data.id
+			if config.is_debug() then
+				print("DEBUG: Found existing task at line", line_num, "ID:", data.id)
+			end
+		end
+	end
+
+	-- Sort created tasks by depth (parents first, then children)
+	table.sort(changes.created_tasks, function(a, b)
+		return a.depth < b.depth
+	end)
+
+	-- Create tasks with proper hierarchy (parents first)
+	local created_tasks_by_line = {}
+
 	for _, task in ipairs(changes.created_tasks) do
 		if config.is_valid(task) and config.is_valid(task.content) then
 			table.insert(operations, function(cb)
+				-- Determine section ID for this task
+				local section_id = find_section_for_task(task.line, lines)
+
+				-- Determine parent ID for this task
+				local parent_id =
+					find_parent_for_task(task.line, task.depth, lines, created_tasks_by_line, existing_tasks_by_line)
+
 				if config.is_debug() then
-					print("DEBUG: Creating task:", task.content, "with description:", task.description or "")
+					print("DEBUG: Creating task:", task.content, "at line:", task.line, "depth:", task.depth)
+					print("  section_id:", section_id or "none", "parent_id:", parent_id or "none")
+					print("  description:", task.description or "none")
 				end
-				api.create_task(project_id, task.content, nil, nil, task.description, function(result)
+
+				api.create_task(project_id, task.content, section_id, parent_id, task.description, function(result)
 					if not result.error and result.data and result.data.id then
+						local task_id = tostring(result.data.id)
+
 						-- Track the created task
 						created_items[task.line] = {
 							type = "task",
-							id = tostring(result.data.id),
+							id = task_id,
 							content = task.content,
 							description = task.description or "",
 							is_completed = task.is_completed or false,
 						}
+
+						-- Map task line to task ID for child task creation
+						created_tasks_by_line[task.line] = task_id
+
 						if config.is_debug() then
-							print("DEBUG: Task created with ID:", result.data.id)
+							print(
+								"DEBUG: Task created with ID:",
+								task_id,
+								"section_id:",
+								section_id or "none",
+								"parent_id:",
+								parent_id or "none"
+							)
 						end
 					end
 					cb(result)
@@ -226,6 +371,22 @@ function M.execute_sync_operations(project_id, changes, lines, callback)
 			end)
 		end
 	end)
+end
+
+-- Helper function to calculate effective depth from indent string
+function M.calculate_effective_depth(indent_str)
+	local effective_indent = 0
+
+	for i = 1, #indent_str do
+		local char = indent_str:sub(i, i)
+		if char == "\t" then
+			effective_indent = effective_indent + 2
+		elseif char == " " then
+			effective_indent = effective_indent + 1
+		end
+	end
+
+	return math.floor(effective_indent / 2)
 end
 
 function M.execute_operations_sequence(operations, callback)

@@ -40,12 +40,10 @@ function M.project_to_markdown(project_data)
 		print("DEBUG: Sections count:", #(project_data.sections or {}))
 	end
 
-	-- Create ordered list of content items (sections and unsectioned tasks)
-	local content_items = {}
-	local sectioned_tasks = {}
-
-	-- Group tasks by section
+	-- Separate unsectioned and sectioned tasks
+	local unsectioned_tasks = {}
 	local task_by_section = {}
+
 	for _, task in ipairs(project_data.tasks or {}) do
 		if config.is_valid(task) then
 			if config.is_valid(task.section_id) then
@@ -53,102 +51,82 @@ function M.project_to_markdown(project_data)
 					task_by_section[task.section_id] = {}
 				end
 				table.insert(task_by_section[task.section_id], task)
-				sectioned_tasks[task.id] = true
+			else
+				table.insert(unsectioned_tasks, task)
 			end
 		end
 	end
 
-	-- Add sections to content items
+	-- Sort unsectioned tasks by order
+	table.sort(unsectioned_tasks, function(a, b)
+		local order_a = config.is_valid(a.order) and a.order or 999999
+		local order_b = config.is_valid(b.order) and b.order or 999999
+		return order_a < order_b
+	end)
+
+	-- Add unsectioned tasks first
+	if #unsectioned_tasks > 0 then
+		if config.is_debug() then
+			print("DEBUG: Adding", #unsectioned_tasks, "unsectioned tasks first")
+		end
+		M.add_tasks_to_markdown(unsectioned_tasks, lines, extmarks, nil)
+		table.insert(lines, "")
+	end
+
+	-- Sort sections by order
+	local sections = {}
 	for _, section in ipairs(project_data.sections or {}) do
 		if config.is_valid(section) and config.is_valid(section.id) then
 			local section_order = config.is_valid(section.order) and section.order or 999999
-			table.insert(content_items, {
-				type = "section",
+			table.insert(sections, {
 				data = section,
 				tasks = task_by_section[section.id] or {},
 				order = section_order,
 			})
-
-			if config.is_debug() then
-				print(
-					"DEBUG: Added section to content:",
-					section.name,
-					"order:",
-					section_order,
-					"tasks:",
-					#(task_by_section[section.id] or {})
-				)
-			end
 		end
 	end
 
-	-- Add unsectioned tasks to content items
-	for _, task in ipairs(project_data.tasks or {}) do
-		if config.is_valid(task) and not sectioned_tasks[task.id] then
-			local task_order = config.is_valid(task.order) and task.order or 999999
-			table.insert(content_items, {
-				type = "task",
-				data = task,
-				order = task_order,
-			})
-
-			if config.is_debug() then
-				print("DEBUG: Added unsectioned task to content:", task.content, "order:", task_order)
-			end
-		end
-	end
-
-	-- Sort content items by order
-	table.sort(content_items, function(a, b)
+	table.sort(sections, function(a, b)
 		return a.order < b.order
 	end)
 
-	if config.is_debug() then
-		print("DEBUG: Content items order:")
-		for i, item in ipairs(content_items) do
-			if item.type == "section" then
-				print("  ", i, "Section:", item.data.name, "order:", item.order)
-			else
-				print("  ", i, "Task:", item.data.content, "order:", item.order)
-			end
+	-- Add sections and their tasks
+	for _, section_info in ipairs(sections) do
+		local section = section_info.data
+		local section_tasks = section_info.tasks
+
+		if config.is_debug() then
+			print("DEBUG: Adding section", section.name, "with", #section_tasks, "tasks, order:", section_info.order)
 		end
-	end
 
-	-- Render content items in order
-	for _, item in ipairs(content_items) do
-		if item.type == "section" then
-			-- Add section header
-			local section_name = config.is_valid(item.data.name) and item.data.name or "Untitled Section"
-			table.insert(lines, "## " .. section_name)
-			table.insert(extmarks, {
-				line = #lines - 1,
-				col = 0,
-				opts = {
-					right_gravity = false,
-					hl_mode = "combine",
-				},
-				-- Store our custom data separately
-				todoist_data = {
-					type = "section",
-					id = tostring(item.data.id),
-					name = section_name,
-				},
-			})
+		-- Add section header
+		local section_name = config.is_valid(section.name) and section.name or "Untitled Section"
+		table.insert(lines, "## " .. section_name)
+		table.insert(extmarks, {
+			line = #lines - 1,
+			col = 0,
+			opts = {
+				right_gravity = false,
+				hl_mode = "combine",
+			},
+			-- Store our custom data separately
+			todoist_data = {
+				type = "section",
+				id = tostring(section.id),
+				name = section_name,
+			},
+		})
+		table.insert(lines, "")
+
+		-- Add tasks for this section
+		if #section_tasks > 0 then
+			M.add_tasks_to_markdown(section_tasks, lines, extmarks, section.id)
 			table.insert(lines, "")
-
-			-- Add tasks for this section
-			if #item.tasks > 0 then
-				M.add_tasks_to_markdown(item.tasks, lines, extmarks, item.data.id)
-				table.insert(lines, "")
-			end
-		elseif item.type == "task" then
-			-- Add unsectioned task
-			M.add_single_task_to_markdown(item.data, lines, extmarks, 0, {})
 		end
 	end
 
 	-- If no content at all, add a helpful message
-	if #content_items == 0 then
+	if #unsectioned_tasks == 0 and #sections == 0 then
 		table.insert(lines, "_No tasks found. Start typing to add some!_")
 		table.insert(lines, "")
 		table.insert(lines, "## Example")
@@ -669,6 +647,8 @@ function M.parse_markdown_to_changes(lines, extmarks)
 						i,
 						"with effective indent",
 						task_effective_indent,
+						"depth:",
+						depth,
 						"indent string:",
 						vim.inspect(indent_str)
 					)
@@ -723,6 +703,8 @@ function M.parse_markdown_to_changes(lines, extmarks)
 							content,
 							"at line",
 							line_num,
+							"depth:",
+							depth,
 							"with description:",
 							description
 						)
