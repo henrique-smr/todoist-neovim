@@ -3,6 +3,7 @@ local M = {}
 
 local curl = require("plenary.curl")
 local json = vim.json
+local config = require("todoist.config")
 
 M.base_url = "https://api.todoist.com/rest/v2"
 M.token = nil
@@ -25,16 +26,29 @@ local function make_request(method, endpoint, data, callback)
 	}
 
 	local url = M.base_url .. endpoint
+
+	if config.is_debug() then
+		print("DEBUG: Making API request:", method, url)
+		if data then
+			print("DEBUG: Request data:", vim.inspect(data))
+		end
+	end
+
 	local opts = {
 		method = method,
 		url = url,
 		headers = headers,
 		callback = function(response)
 			vim.schedule(function()
+				if config.is_debug() then
+					print("DEBUG: API response status:", response.status)
+					print("DEBUG: API response body:", response.body)
+				end
+
 				if response.status >= 200 and response.status < 300 then
-					local success, data = pcall(json.decode, response.body)
+					local success, parsed_data = pcall(json.decode, response.body)
 					if success then
-						callback({ data = data })
+						callback({ data = parsed_data })
 					else
 						callback({ error = "Failed to parse JSON response: " .. (response.body or "") })
 					end

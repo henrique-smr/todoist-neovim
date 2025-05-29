@@ -4,13 +4,12 @@
 
 local M = {}
 
--- Configuration
-M.config = {
-	api_token = nil,
-	auto_sync = true,
-	sync_interval = 30000, -- 30 seconds
-	debug = false,
-}
+-- Load modules
+local config = require("todoist.config")
+local api = require("todoist.api")
+local parser = require("todoist.parser")
+local sync = require("todoist.sync")
+local ui = require("todoist.ui")
 
 -- Internal state
 local projects = {}
@@ -18,22 +17,16 @@ local current_project = nil
 local sync_timer = nil
 local ns_id = vim.api.nvim_create_namespace("todoist")
 
--- Todoist API client
-local api = require("todoist.api")
-local parser = require("todoist.parser")
-local sync = require("todoist.sync")
-local ui = require("todoist.ui")
-
 -- Setup function
 function M.setup(opts)
-	M.config = vim.tbl_deep_extend("force", M.config, opts or {})
+	config.setup(opts)
 
-	if not M.config.api_token then
+	if not config.get_token() then
 		vim.notify("Todoist API token not provided. Please set it in your config.", vim.log.levels.ERROR)
 		return
 	end
 
-	api.set_token(M.config.api_token)
+	api.set_token(config.get_token())
 
 	-- Create user commands
 	vim.api.nvim_create_user_command("TodoistProjects", M.list_projects, {})
@@ -53,14 +46,14 @@ function M.setup(opts)
 		group = augroup,
 		pattern = "*.todoist.md",
 		callback = function()
-			if M.config.auto_sync then
+			if config.get_auto_sync() then
 				M.sync_current_buffer()
 			end
 		end,
 	})
 
 	-- Set up auto-sync timer
-	if M.config.auto_sync then
+	if config.get_auto_sync() then
 		M.start_auto_sync()
 	end
 
@@ -76,6 +69,10 @@ function M.setup(opts)
 			end
 		end,
 	})
+
+	if config.is_debug() then
+		print("DEBUG: Todoist.nvim setup completed")
+	end
 end
 
 -- List all projects
@@ -87,6 +84,9 @@ function M.list_projects()
 		end
 
 		projects = result.data
+		if config.is_debug() then
+			print("DEBUG: Fetched projects:", vim.inspect(projects))
+		end
 		ui.show_project_list(projects, M.open_project)
 	end)
 end
@@ -130,6 +130,10 @@ function M.open_project(project_name)
 
 	current_project = project
 
+	if config.is_debug() then
+		print("DEBUG: Opening project:", vim.inspect(project))
+	end
+
 	-- Get project data with tasks and sections
 	api.get_project_data(project.id, function(result)
 		if result.error then
@@ -139,6 +143,10 @@ function M.open_project(project_name)
 
 		-- Add project info to the data
 		result.data.project = project
+
+		if config.is_debug() then
+			print("DEBUG: Project data received:", vim.inspect(result.data))
+		end
 
 		local filename = project.name:gsub("[^%w%s%-_]", "") .. ".todoist.md"
 		local filepath = vim.fn.expand("~/todoist/" .. filename)
@@ -152,6 +160,12 @@ function M.open_project(project_name)
 
 		-- Generate markdown content
 		local content = parser.project_to_markdown(result.data)
+
+		if config.is_debug() then
+			print("DEBUG: Generated markdown lines:", vim.inspect(content.lines))
+			print("DEBUG: Generated extmarks:", vim.inspect(content.extmarks))
+		end
+
 		vim.api.nvim_buf_set_lines(buf, 0, -1, false, content.lines)
 
 		-- Set extmarks for tracking
@@ -268,8 +282,8 @@ function M.start_auto_sync()
 
 	sync_timer = vim.loop.new_timer()
 	sync_timer:start(
-		M.config.sync_interval,
-		M.config.sync_interval,
+		config.get_sync_interval(),
+		config.get_sync_interval(),
 		vim.schedule_wrap(function()
 			local buf = vim.api.nvim_get_current_buf()
 			local bufname = vim.api.nvim_buf_get_name(buf)

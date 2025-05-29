@@ -1,6 +1,8 @@
 -- Parser for converting between Todoist data and markdown
 local M = {}
 
+local config = require("todoist.config")
+
 function M.project_to_markdown(project_data)
 	local lines = {}
 	local extmarks = {}
@@ -14,11 +16,11 @@ function M.project_to_markdown(project_data)
 	table.insert(lines, "# " .. project_name)
 	table.insert(lines, "")
 
-	-- if M.config and M.config.debug then
-	print("DEBUG: Project data:", vim.inspect(project_data))
-	print("DEBUG: Tasks count:", #(project_data.tasks or {}))
-	print("DEBUG: Sections count:", #(project_data.sections or {}))
-	-- end
+	if config.is_debug() then
+		print("DEBUG: Project data:", vim.inspect(project_data))
+		print("DEBUG: Tasks count:", #(project_data.tasks or {}))
+		print("DEBUG: Sections count:", #(project_data.sections or {}))
+	end
 
 	-- Group tasks by section
 	local sections = {}
@@ -36,17 +38,22 @@ function M.project_to_markdown(project_data)
 
 	-- Group tasks
 	for _, task in ipairs(project_data.tasks or {}) do
+		if config.is_debug() then
+			print("DEBUG: Processing task:", vim.inspect(task))
+		end
+
 		if task.section_id and sections[task.section_id] then
 			table.insert(sections[task.section_id].tasks, task)
-			print("DEBUG: Adding task to section:", task.content, "in section", sections[task.section_id].section.name)
 		else
 			table.insert(unsectioned_tasks, task)
-			print("DEBUG: Adding unsectioned task:", task.content)
 		end
 	end
 
 	-- Add unsectioned tasks first
 	if #unsectioned_tasks > 0 then
+		if config.is_debug() then
+			print("DEBUG: Adding", #unsectioned_tasks, "unsectioned tasks")
+		end
 		M.add_tasks_to_markdown(unsectioned_tasks, lines, extmarks, nil)
 		table.insert(lines, "")
 	end
@@ -54,6 +61,10 @@ function M.project_to_markdown(project_data)
 	-- Add sectioned tasks
 	for section_id, section_data in pairs(sections) do
 		if #section_data.tasks > 0 then
+			if config.is_debug() then
+				print("DEBUG: Adding section", section_data.section.name, "with", #section_data.tasks, "tasks")
+			end
+
 			-- Add section header
 			table.insert(lines, "## " .. section_data.section.name)
 			table.insert(extmarks, {
@@ -85,10 +96,10 @@ function M.project_to_markdown(project_data)
 		table.insert(lines, "- [x] Completed task")
 	end
 
-	print("DEBUG: Final lines count:", #lines)
-	print("DEBUG: Final extmarks count:", #extmarks)
-	print("DEBUG: Lines content:", vim.inspect(lines))
-	print("DEBUG: Extmarks content:", vim.inspect(extmarks))
+	if config.is_debug() then
+		print("DEBUG: Final lines count:", #lines)
+		print("DEBUG: Final extmarks count:", #extmarks)
+	end
 
 	return {
 		lines = lines,
@@ -102,12 +113,21 @@ function M.add_tasks_to_markdown(tasks, lines, extmarks, section_id)
 	local task_children = {}
 
 	for _, task in ipairs(tasks) do
+		if config.is_debug() then
+			print("DEBUG: Processing task:", vim.inspect(task))
+		end
 		if task.parent_id then
 			if not task_children[task.parent_id] then
 				task_children[task.parent_id] = {}
 			end
+			if config.is_debug() then
+				print("DEBUG: Adding task", task.id, "as child of", task.parent_id)
+			end
 			table.insert(task_children[task.parent_id], task)
 		else
+			if config.is_debug() then
+				print("DEBUG: Adding root task", task.id)
+			end
 			table.insert(root_tasks, task)
 		end
 	end
@@ -116,6 +136,13 @@ function M.add_tasks_to_markdown(tasks, lines, extmarks, section_id)
 	table.sort(root_tasks, function(a, b)
 		return (a.order or 0) < (b.order or 0)
 	end)
+
+	if config.is_debug() then
+		print("DEBUG: Root tasks for section:", #root_tasks)
+		for i, task in ipairs(root_tasks) do
+			print("DEBUG: Root task", i, ":", task.content)
+		end
+	end
 
 	-- Add tasks recursively
 	for _, task in ipairs(root_tasks) do
@@ -126,7 +153,11 @@ end
 function M.add_task_to_markdown(task, lines, extmarks, depth, task_children)
 	local indent = string.rep("  ", depth)
 	local checkbox = task.is_completed and "[x]" or "[ ]"
-	local task_line = indent .. "- " .. checkbox .. " " .. task.content
+	local task_line = indent .. "- " .. checkbox .. " " .. (task.content or "")
+
+	if config.is_debug() then
+		print("DEBUG: Adding task line:", task_line)
+	end
 
 	table.insert(lines, task_line)
 	table.insert(extmarks, {
@@ -149,6 +180,7 @@ function M.add_task_to_markdown(task, lines, extmarks, depth, task_children)
 		for _, desc_line in ipairs(desc_lines) do
 			table.insert(lines, indent .. "  " .. desc_line)
 		end
+		table.insert(lines, "")
 	end
 
 	-- Add children
@@ -157,6 +189,10 @@ function M.add_task_to_markdown(task, lines, extmarks, depth, task_children)
 		table.sort(task_children[task.id], function(a, b)
 			return (a.order or 0) < (b.order or 0)
 		end)
+
+		if config.is_debug() then
+			print("DEBUG: Adding", #task_children[task.id], "children for task:", task.content)
+		end
 
 		for _, child in ipairs(task_children[task.id]) do
 			M.add_task_to_markdown(child, lines, extmarks, depth + 1, task_children)

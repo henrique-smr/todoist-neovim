@@ -3,9 +3,14 @@ local M = {}
 
 local api = require("todoist.api")
 local parser = require("todoist.parser")
+local config = require("todoist.config")
 
 function M.sync_buffer_changes(project_id, lines, extmarks, callback)
 	local changes = parser.parse_markdown_to_changes(lines, extmarks)
+
+	if config.is_debug() then
+		print("DEBUG: Sync changes:", vim.inspect(changes))
+	end
 
 	-- Execute changes in order: deletes, updates, creates
 	M.execute_sync_operations(project_id, changes, callback)
@@ -51,6 +56,10 @@ function M.execute_sync_operations(project_id, changes, callback)
 		table.insert(operations, function(cb)
 			api.create_task(project_id, task.content, nil, nil, cb)
 		end)
+	end
+
+	if config.is_debug() then
+		print("DEBUG: Executing", #operations, "sync operations")
 	end
 
 	-- Execute all operations

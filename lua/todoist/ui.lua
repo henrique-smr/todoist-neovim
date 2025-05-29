@@ -1,10 +1,16 @@
 -- UI components
 local M = {}
 
+local config = require("todoist.config")
+
 function M.show_project_list(projects, on_select)
 	local items = {}
 	for _, project in ipairs(projects) do
 		table.insert(items, project.name)
+	end
+
+	if config.is_debug() then
+		print("DEBUG: Showing project list with", #items, "projects")
 	end
 
 	vim.schedule(function()
@@ -15,6 +21,9 @@ function M.show_project_list(projects, on_select)
 			end,
 		}, function(choice)
 			if choice then
+				if config.is_debug() then
+					print("DEBUG: User selected project:", choice)
+				end
 				vim.schedule(function()
 					on_select(choice)
 				end)
