@@ -7,6 +7,8 @@ local u = require("todoist.utils")
 
 function M.setup(opts)
 	assert(opts and opts.token, "Token deve ser definido")
+
+	M.nid = vim.api.nvim_create_namespace("todoist-neovim")
 	M.store = require("todoist.store"):new()
 	M.store:from_file()
 	client.init({
@@ -114,11 +116,59 @@ function M.add_item(opts)
 	local content = vim.fn.input("Enter the task content: ")
 	local description = vim.fn.input("Enter the task description: ")
 end
+local function make_item(opts)
+	table.insert(opts.content, "")
+
+	local check_box = opts.item.completed_at ~= vim.NIL and "- [x]" or "- [ ]"
+
+	table.insert(
+		opts.content,
+		string.rep("\t", opts.depth) .. check_box .. " " .. opts.item.content .. " {%item/" .. opts.item.id .. "}"
+	)
+	local start_row = #opts.content
+
+	if #opts.item.description > 0 then
+		table.insert(opts.content, "")
+		local description_lines = vim.split(opts.item.description, "\n", { trimempty = true })
+		for _, description_line in ipairs(description_lines) do
+			if #description_line > 0 then
+				table.insert(opts.content, string.rep("\t", opts.depth + 1) .. description_line)
+			else
+				table.insert(opts.content, string.rep("\t", opts.depth + 1))
+			end
+		end
+	end
+	local end_row = #opts.content
+
+	opts.metadata.items[opts.item.id] = { range = { start_row, end_row }, item = opts.item }
+
+	for _, sub_item in ipairs(opts.items_list) do
+		if sub_item.parent_id == opts.item.id then
+			make_item({
+				content = opts.content,
+				item = sub_item,
+				items_list = opts.items_list,
+				metadata = opts.metadata,
+				depth = opts.depth + 1,
+			})
+		end
+	end
+
+	table.insert(opts.content, "")
+end
 
 function M.open_project(project_id)
 	local projects = M.store:get("projects")
 	local sections = M.store:get("sections")
 	local items = M.store:get("items")
+
+	local _metadata = {
+		projects = {},
+		sections = {},
+		items = {},
+		items_by_marks = {},
+	}
+
 	local project
 	for _, proj in pairs(projects) do
 		if proj.id == project_id then
@@ -144,46 +194,9 @@ function M.open_project(project_id)
 	local content = {
 		"# " .. project.name .. " {%project/" .. project.id .. "}",
 	}
-	local function make_item(item)
-		table.insert(content, "")
-		local check_box = item.completed_at ~= vim.NIL and "- [x]" or "- [ ]"
-		table.insert(content, check_box .. " " .. item.content .. " {%item/" .. item.id .. "}")
-		if #item.description > 0 then
-			table.insert(content, "")
-			local description_lines = vim.split(item.description, "\n", { trimempty = true })
-			for _, description_line in ipairs(description_lines) do
-				if #description_line > 0 then
-					table.insert(content, "\t *" .. description_line .. "*")
-				else
-					table.insert(content, "\t")
-				end
-			end
-			-- table.insert(content, "")
-		end
-		for _, sub_item in ipairs(project_items) do
-			if sub_item.parent_id == item.id then
-				table.insert(content, "")
-				local sub_check_box = sub_item.completed_at ~= vim.NIL and "- [x]" or "- [ ]"
-				table.insert(
-					content,
-					"\t" .. sub_check_box .. " " .. sub_item.content .. " {%item/" .. sub_item.id .. "}"
-				)
-				if #sub_item.description > 0 then
-					table.insert(content, "")
-					local description_lines = vim.split(sub_item.description, "\n", { trimempty = true })
-					for _, description_line in ipairs(description_lines) do
-						if #description_line > 0 then
-							table.insert(content, "\t\t *" .. description_line .. "*")
-						else
-							table.insert(content, "\t\t")
-						end
-					end
-					-- table.insert(content, "")
-				end
-			end
-		end
-		table.insert(content, "")
-	end
+
+	_metadata.projects[project.id] = { range = { #content, #content } }
+
 	table.sort(project_items, function(a, b)
 		return a.child_order < b.child_order
 	end)
@@ -200,21 +213,48 @@ function M.open_project(project_id)
 	end)
 	for _, item in ipairs(project_items) do
 		if item.parent_id == vim.NIL then
-			make_item(item)
+			make_item({
+				content = content,
+				item = item,
+				depth = 0,
+				metadata = _metadata,
+				items_list = project_items,
+			})
 		end
 	end
 	for _, section in ipairs(project_sections) do
 		table.insert(content, "")
 		table.insert(content, "## " .. section.name .. " {%section/" .. section.id .. "}")
+
+		_metadata.sections[section.id] = { range = { #content, #content } }
+
 		for _, item in pairs(items) do
 			if item.section_id == section.id and item.parent_id == vim.NIL then
-				make_item(item)
+				make_item({
+					content = content,
+					item = item,
+					depth = 0,
+					metadata = _metadata,
+					items_list = project_items,
+				})
 			end
 		end
 	end
 
 	local buffer = u.create_project_buffer(content)
 	local api = vim.api
+
+	for id, o in pairs(_metadata.items) do
+		local ext_id = api.nvim_buf_set_extmark(buffer, M.nid, o.range[1] - 1, 0, {
+			virt_text = { { "(" .. id .. ")", "Comment" } },
+			virt_text_pos = "eol",
+			end_row = o.range[2],
+			invalidate = true,
+			undo_restore = true,
+			virt_text_hide = true,
+		})
+		_metadata.items_by_marks[ext_id] = o.item
+	end
 
 	api.nvim_buf_set_keymap(buffer, "n", "q", "", {
 		noremap = true,
@@ -226,11 +266,14 @@ function M.open_project(project_id)
 		noremap = true,
 		callback = function()
 			vim.api.nvim_set_option_value("modifiable", true, { scope = "local" })
-			local status, item_id = u.buf_toggle_task_list_item()
+			local status = u.buf_toggle_task_list_item()
 			vim.api.nvim_set_option_value("modifiable", false, { scope = "local" })
-			if status == "checked" then
+			local mark = u.get_mark_at_line(M.nid)
+			if status == "checked" and mark then
+				local item_id = _metadata.items_by_marks[mark[1]].id
 				client.complete_item(item_id)
-			elseif status == "unchecked" then
+			elseif status == "unchecked" and mark then
+				local item_id = _metadata.items_by_marks[mark[1]].id
 				client.uncomplete_item(item_id)
 			end
 		end,
@@ -247,6 +290,15 @@ function M.open_project(project_id)
 		nowait = true,
 		callback = function()
 			u.buf_prev_task()
+		end,
+	})
+	api.nvim_buf_set_keymap(buffer, "n", "&", "", {
+		noremap = true,
+		nowait = true,
+		callback = function()
+			local mark = u.get_mark_at_line(M.nid)
+			-- -- local text = ms[1][3].virt_text
+			print(vim.inspect(_metadata.items_by_marks[mark[1]]))
 		end,
 	})
 end

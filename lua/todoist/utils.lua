@@ -65,8 +65,8 @@ function M.buf_toggle_task_list_item()
 
 			local new_line = line:sub(1, start_col) .. new_checkbox .. line:sub(end_col + 1)
 			vim.api.nvim_buf_set_lines(bufnr, start_row, start_row + 1, false, { new_line })
-			local id = line:match("{%%item/(.*)}")
-			return "checked", id
+			-- local id = line:match("{%%item/(.*)}")
+			return "checked"
 		end
 		if node:type() == "task_list_marker_checked" then
 			local line = vim.api.nvim_buf_get_lines(bufnr, start_row, start_row + 1, false)[1]
@@ -74,11 +74,11 @@ function M.buf_toggle_task_list_item()
 
 			local new_line = line:sub(1, start_col) .. new_checkbox .. line:sub(end_col + 1)
 			vim.api.nvim_buf_set_lines(bufnr, start_row, start_row + 1, false, { new_line })
-			local id = line:match("{%%item/(.*)}")
-			return "unchecked", id
+			-- local id = line:match("{%%item/(.*)}")
+			return "unchecked"
 		end
 	end
-	return nil, nil
+	return nil
 end
 
 function M.buf_next_task()
@@ -117,6 +117,13 @@ function M.buf_prev_task()
 	if last_row then
 		vim.api.nvim_win_set_cursor(0, { last_row, last_col })
 	end
+end
+
+function M.get_mark_at_line(ns_id)
+	local bufnr = vim.api.nvim_get_current_buf()
+	local cursor_pos = vim.api.nvim_win_get_cursor(0)
+	local row = cursor_pos[1] - 1 -- Lua uses 0-based indexing for rows
+	return vim.api.nvim_buf_get_extmarks(bufnr, ns_id, row, row + 1, { details = true })[1]
 end
 
 return M
