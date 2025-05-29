@@ -48,7 +48,16 @@ function M.execute_sync_operations(project_id, changes, lines, callback)
 		if config.is_valid(task) and config.is_valid(task.id) and config.is_valid(task.content) then
 			table.insert(operations, function(cb)
 				if config.is_debug() then
-					print("DEBUG: Updating task:", task.id, "content:", task.content, "completed:", task.is_completed)
+					print(
+						"DEBUG: Updating task:",
+						task.id,
+						"content:",
+						task.content,
+						"description:",
+						task.description,
+						"completed:",
+						task.is_completed
+					)
 				end
 
 				-- First get the current task state to avoid redundant operations
@@ -63,27 +72,39 @@ function M.execute_sync_operations(project_id, changes, lines, callback)
 
 					local current_task = get_result.data
 					local content_needs_update = current_task.content ~= task.content
+					local description_needs_update = (current_task.description or "") ~= (task.description or "")
 					local completion_needs_toggle = current_task.is_completed ~= task.is_completed
 
 					if config.is_debug() then
 						print(
 							"DEBUG: Current task state - content:",
 							current_task.content,
+							"description:",
+							current_task.description or "",
 							"completed:",
 							current_task.is_completed
 						)
-						print("DEBUG: Desired task state - content:", task.content, "completed:", task.is_completed)
+						print(
+							"DEBUG: Desired task state - content:",
+							task.content,
+							"description:",
+							task.description or "",
+							"completed:",
+							task.is_completed
+						)
 						print(
 							"DEBUG: Needs content update:",
 							content_needs_update,
+							"needs description update:",
+							description_needs_update,
 							"needs completion toggle:",
 							completion_needs_toggle
 						)
 					end
 
-					-- Update content if needed
-					if content_needs_update then
-						api.update_task(task.id, task.content, function(update_result)
+					-- Update content/description if needed
+					if content_needs_update or description_needs_update then
+						api.update_task(task.id, task.content, task.description, function(update_result)
 							if update_result.error then
 								cb(update_result)
 								return
@@ -97,7 +118,7 @@ function M.execute_sync_operations(project_id, changes, lines, callback)
 							end
 						end)
 					elseif completion_needs_toggle then
-						-- Only toggle completion if content doesn't need updating
+						-- Only toggle completion if content/description doesn't need updating
 						api.toggle_task(task.id, task.is_completed, cb)
 					else
 						-- No changes needed
@@ -151,15 +172,16 @@ function M.execute_sync_operations(project_id, changes, lines, callback)
 		if config.is_valid(task) and config.is_valid(task.content) then
 			table.insert(operations, function(cb)
 				if config.is_debug() then
-					print("DEBUG: Creating task:", task.content)
+					print("DEBUG: Creating task:", task.content, "with description:", task.description or "")
 				end
-				api.create_task(project_id, task.content, nil, nil, function(result)
+				api.create_task(project_id, task.content, nil, nil, task.description, function(result)
 					if not result.error and result.data and result.data.id then
 						-- Track the created task
 						created_items[task.line] = {
 							type = "task",
 							id = tostring(result.data.id),
 							content = task.content,
+							description = task.description or "",
 							is_completed = task.is_completed or false,
 						}
 						if config.is_debug() then
@@ -233,4 +255,3 @@ function M.execute_operations_sequence(operations, callback)
 end
 
 return M
-

@@ -161,10 +161,11 @@ function M.add_task_to_markdown(task, lines, extmarks, depth, task_children)
 	local is_completed = config.is_valid(task.is_completed) and task.is_completed or false
 	local checkbox = is_completed and "[x]" or "[ ]"
 	local task_content = config.is_valid(task.content) and task.content or "No content"
+	local task_description = config.is_valid(task.description) and task.description or ""
 	local task_line = indent .. "- " .. checkbox .. " " .. task_content
 
 	if config.is_debug() then
-		print("DEBUG: Adding task line:", task_line, "ID:", task.id)
+		print("DEBUG: Adding task line:", task_line, "ID:", task.id, "description:", task_description)
 	end
 
 	table.insert(lines, task_line)
@@ -180,6 +181,7 @@ function M.add_task_to_markdown(task, lines, extmarks, depth, task_children)
 			type = "task",
 			id = tostring(task.id),
 			content = task_content,
+			description = task_description,
 			completed = is_completed,
 			parent_id = config.is_valid(task.parent_id) and tostring(task.parent_id) or nil,
 			section_id = config.is_valid(task.section_id) and tostring(task.section_id) or nil,
@@ -332,6 +334,7 @@ function M.update_extmarks_with_created_items(buf, ns_id, created_items)
 
 			if item.type == "task" then
 				todoist_data.content = item.content
+				todoist_data.description = item.description or ""
 				todoist_data.completed = item.is_completed or false
 				todoist_data.parent_id = nil
 				todoist_data.section_id = nil
@@ -364,6 +367,55 @@ function M.update_extmarks_with_created_items(buf, ns_id, created_items)
 			end
 		end
 	end
+end
+
+-- Parse task description from markdown lines following a task
+function M.parse_task_description(lines, task_line_index, task_indent_level)
+	local description_lines = {}
+	local i = task_line_index + 1
+
+	-- Skip empty line immediately after task (if it exists)
+	if i <= #lines and lines[i] == "" then
+		i = i + 1
+	end
+
+	-- Parse description lines
+	while i <= #lines do
+		local line = lines[i]
+
+		-- Stop if we hit another task, section, or less indented content
+		if line:match("^%s*%-") or line:match("^#") then
+			break
+		end
+
+		-- Stop if we hit a line that's not indented enough
+		local line_indent = line:match("^(%s*)")
+		if line ~= "" and #line_indent <= task_indent_level then
+			break
+		end
+
+		-- Add to description (remove task indentation + 2 spaces)
+		if line == "" then
+			table.insert(description_lines, "")
+		else
+			local expected_indent = string.rep(" ", task_indent_level + 2)
+			if line:sub(1, #expected_indent) == expected_indent then
+				table.insert(description_lines, line:sub(#expected_indent + 1))
+			else
+				-- Less indented than expected, might be part of description still
+				table.insert(description_lines, line:gsub("^%s*", ""))
+			end
+		end
+
+		i = i + 1
+	end
+
+	-- Remove trailing empty lines
+	while #description_lines > 0 and description_lines[#description_lines] == "" do
+		table.remove(description_lines)
+	end
+
+	return table.concat(description_lines, "\n"), i - 1
 end
 
 function M.parse_markdown_to_changes(lines, extmarks)
@@ -405,9 +457,11 @@ function M.parse_markdown_to_changes(lines, extmarks)
 	end
 
 	local seen_ids = {}
+	local i = 1
 
 	-- Parse lines and detect changes
-	for i, line in ipairs(lines) do
+	while i <= #lines do
+		local line = lines[i]
 		local line_num = i - 1
 
 		-- Check for section headers
@@ -446,51 +500,73 @@ function M.parse_markdown_to_changes(lines, extmarks)
 					print("DEBUG: New section created:", section_title, "at line", line_num)
 				end
 			end
-		end
+			i = i + 1
+		else
+			-- Check for tasks
+			local indent, checkbox, content = line:match("^(%s*)%- %[([%sx])%] (.+)$")
+			if config.is_valid(content) then
+				local depth = math.floor(#indent / 2)
+				local is_completed = checkbox == "x"
 
-		-- Check for tasks
-		local indent, checkbox, content = line:match("^(%s*)%- %[([%sx])%] (.+)$")
-		if config.is_valid(content) then
-			local depth = math.floor(#indent / 2)
-			local is_completed = checkbox == "x"
+				-- Parse task description
+				local description, last_desc_line = M.parse_task_description(lines, i, #indent)
 
-			local extmark_data = extmark_by_line[line_num]
+				local extmark_data = extmark_by_line[line_num]
 
-			if config.is_valid(extmark_data) and extmark_data.type == "task" then
-				-- Existing task - check for updates
-				seen_ids[extmark_data.id] = true
+				if config.is_valid(extmark_data) and extmark_data.type == "task" then
+					-- Existing task - check for updates
+					seen_ids[extmark_data.id] = true
 
-				-- Check if content or completion status changed
-				local content_changed = extmark_data.content ~= content
-				local completion_changed = extmark_data.completed ~= is_completed
+					-- Check if content, completion status, or description changed
+					local content_changed = extmark_data.content ~= content
+					local completion_changed = extmark_data.completed ~= is_completed
+					local description_changed = (extmark_data.description or "") ~= description
 
-				if content_changed or completion_changed then
-					table.insert(changes.updated_tasks, {
-						id = extmark_data.id,
-						content = content,
-						is_completed = is_completed,
-					})
-					if config.is_debug() then
-						print("DEBUG: Task updated:", extmark_data.id)
-						if content_changed then
-							print("  Content changed from:", extmark_data.content, "to:", content)
-						end
-						if completion_changed then
-							print("  Completion changed from:", extmark_data.completed, "to:", is_completed)
+					if content_changed or completion_changed or description_changed then
+						table.insert(changes.updated_tasks, {
+							id = extmark_data.id,
+							content = content,
+							description = description,
+							is_completed = is_completed,
+						})
+						if config.is_debug() then
+							print("DEBUG: Task updated:", extmark_data.id)
+							if content_changed then
+								print("  Content changed from:", extmark_data.content, "to:", content)
+							end
+							if completion_changed then
+								print("  Completion changed from:", extmark_data.completed, "to:", is_completed)
+							end
+							if description_changed then
+								print("  Description changed from:", extmark_data.description or "", "to:", description)
+							end
 						end
 					end
+				else
+					-- New task
+					table.insert(changes.created_tasks, {
+						content = content,
+						description = description,
+						is_completed = is_completed,
+						depth = depth,
+						line = line_num,
+					})
+					if config.is_debug() then
+						print(
+							"DEBUG: New task created:",
+							content,
+							"at line",
+							line_num,
+							"with description:",
+							description
+						)
+					end
 				end
+
+				-- Skip to after the description
+				i = last_desc_line + 1
 			else
-				-- New task
-				table.insert(changes.created_tasks, {
-					content = content,
-					is_completed = is_completed,
-					depth = depth,
-					line = line_num,
-				})
-				if config.is_debug() then
-					print("DEBUG: New task created:", content, "at line", line_num)
-				end
+				i = i + 1
 			end
 		end
 	end
