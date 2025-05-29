@@ -77,7 +77,6 @@ function M.project_to_markdown(project_data)
 				line = #lines - 1,
 				col = 0,
 				opts = {
-					-- Don't specify end_col - let it default to the end of line
 					right_gravity = false,
 					hl_mode = "combine",
 				},
@@ -173,7 +172,6 @@ function M.add_task_to_markdown(task, lines, extmarks, depth, task_children)
 		line = #lines - 1,
 		col = 0,
 		opts = {
-			-- Don't specify end_col - let it default to the end of line
 			right_gravity = false,
 			hl_mode = "combine",
 		},
@@ -300,6 +298,11 @@ function M.get_extmarks_with_data(buf, ns_id)
 	return result
 end
 
+-- Expose the extmark data store for external access
+function M.get_extmark_data_store()
+	return extmark_data_store
+end
+
 -- Update extmarks with newly created item IDs
 function M.update_extmarks_with_created_items(buf, ns_id, created_items)
 	if not created_items or vim.tbl_count(created_items) == 0 then
@@ -318,7 +321,6 @@ function M.update_extmarks_with_created_items(buf, ns_id, created_items)
 	for line_num, item in pairs(created_items) do
 		if config.is_valid(item) and config.is_valid(item.id) then
 			local opts = {
-				-- Don't specify end_col - let it default
 				right_gravity = false,
 				hl_mode = "combine",
 			}

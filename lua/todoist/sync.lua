@@ -51,18 +51,60 @@ function M.execute_sync_operations(project_id, changes, lines, callback)
 					print("DEBUG: Updating task:", task.id, "content:", task.content, "completed:", task.is_completed)
 				end
 
-				-- Update content first, then handle completion
-				api.update_task(task.id, task.content, function(update_result)
-					if update_result.error then
-						cb(update_result)
+				-- First get the current task state to avoid redundant operations
+				api.get_task(task.id, function(get_result)
+					if get_result.error then
+						if config.is_debug() then
+							print("DEBUG: Failed to get current task state:", get_result.error)
+						end
+						cb(get_result)
 						return
 					end
 
-					-- Then handle completion status if it changed
-					if config.is_valid(task.is_completed) then
+					local current_task = get_result.data
+					local content_needs_update = current_task.content ~= task.content
+					local completion_needs_toggle = current_task.is_completed ~= task.is_completed
+
+					if config.is_debug() then
+						print(
+							"DEBUG: Current task state - content:",
+							current_task.content,
+							"completed:",
+							current_task.is_completed
+						)
+						print("DEBUG: Desired task state - content:", task.content, "completed:", task.is_completed)
+						print(
+							"DEBUG: Needs content update:",
+							content_needs_update,
+							"needs completion toggle:",
+							completion_needs_toggle
+						)
+					end
+
+					-- Update content if needed
+					if content_needs_update then
+						api.update_task(task.id, task.content, function(update_result)
+							if update_result.error then
+								cb(update_result)
+								return
+							end
+
+							-- Then handle completion status if needed
+							if completion_needs_toggle then
+								api.toggle_task(task.id, task.is_completed, cb)
+							else
+								cb(update_result)
+							end
+						end)
+					elseif completion_needs_toggle then
+						-- Only toggle completion if content doesn't need updating
 						api.toggle_task(task.id, task.is_completed, cb)
 					else
-						cb(update_result)
+						-- No changes needed
+						if config.is_debug() then
+							print("DEBUG: No changes needed for task:", task.id)
+						end
+						cb({ data = {} })
 					end
 				end)
 			end)

@@ -42,15 +42,24 @@ local function make_request(method, endpoint, data, callback)
       vim.schedule(function()
         if config.is_debug() then
           print("DEBUG: API response status:", response.status)
-          print("DEBUG: API response body:", response.body)
+          if response.body and response.body ~= "" then
+            print("DEBUG: API response body:", response.body)
+          else
+            print("DEBUG: API response body: (empty)")
+          end
         end
         
         if response.status >= 200 and response.status < 300 then
-          local success, parsed_data = pcall(json.decode, response.body)
-          if success then
-            callback({ data = parsed_data })
+          -- Handle empty responses (like 204 No Content)
+          if not response.body or response.body == "" then
+            callback({ data = {} })
           else
-            callback({ error = "Failed to parse JSON response: " .. (response.body or "") })
+            local success, parsed_data = pcall(json.decode, response.body)
+            if success then
+              callback({ data = parsed_data })
+            else
+              callback({ error = "Failed to parse JSON response: " .. (response.body or "") })
+            end
           end
         else
           callback({ error = "HTTP " .. response.status .. ": " .. (response.body or "Unknown error") })
@@ -132,11 +141,20 @@ function M.delete_task(task_id, callback)
 end
 
 function M.toggle_task(task_id, is_completed, callback)
+  if config.is_debug() then
+    print("DEBUG: Toggling task", task_id, "to completed:", is_completed)
+  end
+  
   if is_completed then
     make_request("POST", "/tasks/" .. task_id .. "/close", nil, callback)
   else
     make_request("POST", "/tasks/" .. task_id .. "/reopen", nil, callback)
   end
+end
+
+-- Get current task state to avoid redundant toggles
+function M.get_task(task_id, callback)
+  make_request("GET", "/tasks/" .. task_id, nil, callback)
 end
 
 function M.create_section(project_id, name, callback)

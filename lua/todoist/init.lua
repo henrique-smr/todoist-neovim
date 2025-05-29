@@ -267,17 +267,36 @@ function M.toggle_task()
 	-- Update buffer
 	vim.api.nvim_buf_set_lines(buf, line_num, line_num + 1, false, { new_line })
 
-	-- Sync with Todoist API
-	local is_completed = new_line:match("%- %[x%]") ~= nil
-	api.toggle_task(task_id, is_completed, function(result)
-		if result.error then
-			vim.notify("Error toggling task: " .. result.error, vim.log.levels.ERROR)
-			-- Revert the change
-			vim.api.nvim_buf_set_lines(buf, line_num, line_num + 1, false, { current_line })
-		else
-			vim.notify("Task " .. (is_completed and "completed" or "reopened"), vim.log.levels.INFO)
+	-- Get current task state from our extmark to avoid redundant API calls
+	local current_completed = task_extmark[4].completed
+	local new_completed = new_line:match("%- %[x%]") ~= nil
+
+	if config.is_debug() then
+		print("DEBUG: Toggle task - current completed:", current_completed, "new completed:", new_completed)
+	end
+
+	-- Only sync if the state actually changed
+	if current_completed ~= new_completed then
+		api.toggle_task(task_id, new_completed, function(result)
+			if result.error then
+				vim.notify("Error toggling task: " .. result.error, vim.log.levels.ERROR)
+				-- Revert the change
+				vim.api.nvim_buf_set_lines(buf, line_num, line_num + 1, false, { current_line })
+			else
+				vim.notify("Task " .. (new_completed and "completed" or "reopened"), vim.log.levels.INFO)
+
+				-- Update our stored extmark data to reflect the new state
+				local extmark_data_store = parser.get_extmark_data_store()
+				if extmark_data_store[buf] and extmark_data_store[buf][task_extmark[1]] then
+					extmark_data_store[buf][task_extmark[1]].completed = new_completed
+				end
+			end
+		end)
+	else
+		if config.is_debug() then
+			print("DEBUG: No state change needed, skipping API call")
 		end
-	end)
+	end
 end
 
 -- Auto-sync functionality
@@ -325,4 +344,3 @@ function M.get_namespace_id()
 end
 
 return M
-
