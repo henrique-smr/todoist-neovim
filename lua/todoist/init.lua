@@ -1,306 +1,299 @@
-local M = {
-	_show_completed = false,
+-- Todoist.nvim - A Neovim plugin for Todoist integration with markdown
+-- Author: AI Assistant
+-- License: MIT
+
+local M = {}
+
+-- Configuration
+M.config = {
+	api_token = nil,
+	auto_sync = true,
+	sync_interval = 30000, -- 30 seconds
+	debug = false,
 }
 
-local client = require("todoist.sync-client")
-local u = require("todoist.utils")
+-- Internal state
+local projects = {}
+local current_project = nil
+local sync_timer = nil
+local ns_id = vim.api.nvim_create_namespace("todoist")
 
+-- Todoist API client
+local api = require("todoist.api")
+local parser = require("todoist.parser")
+local sync = require("todoist.sync")
+local ui = require("todoist.ui")
+
+-- Setup function
 function M.setup(opts)
-	assert(opts and opts.token, "Token deve ser definido")
+	M.config = vim.tbl_deep_extend("force", M.config, opts or {})
 
-	M.nid = vim.api.nvim_create_namespace("todoist-neovim")
-	M.store = require("todoist.store"):new()
-	M.store:from_file()
-	client.init({
-		token = opts.token, --"169bf39fb2bb874dd11b7f66d061bcad15023b81",
-	})
-	vim.api.nvim_create_user_command("TodoistSync", function()
-		M.sync()
-	end, {})
-	vim.api.nvim_create_user_command("TodoistFullSync", function()
-		M.sync({ full_sync = true })
-	end, {})
-	vim.api.nvim_create_user_command("TodoistFindProjects", function()
-		M.find_projects()
-	end, {})
-	vim.api.nvim_create_user_command("TodoistAddTask", function()
-		M.add_item({})
-	end, {})
-end
-
-function M.sync(opts)
-	local sync_token = (opts and opts.full_sync) and "*" or M.store:get("sync_token") or "*"
-
-	local data = client.sync(sync_token, {
-		"projects",
-		"items",
-		"sections",
-	})
-	if data == nil then
+	if not M.config.api_token then
+		vim.notify("Todoist API token not provided. Please set it in your config.", vim.log.levels.ERROR)
 		return
 	end
 
-	local store_data = {
-		projects = {},
-		items = {},
-		sections = {},
-	}
+	api.set_token(M.config.api_token)
 
-	for _, proj in pairs(data.projects) do
-		store_data.projects[proj.id] = proj
-	end
-	for _, item in pairs(data.items) do
-		store_data.items[item.id] = item
-	end
-	for _, section in pairs(data.sections) do
-		store_data.sections[section.id] = section
-	end
+	-- Create user commands
+	vim.api.nvim_create_user_command("TodoistProjects", M.list_projects, {})
+	vim.api.nvim_create_user_command("TodoistCreateProject", function(opts)
+		M.create_project(opts.args)
+	end, { nargs = 1 })
+	vim.api.nvim_create_user_command("TodoistOpen", function(opts)
+		M.open_project(opts.args)
+	end, { nargs = 1, complete = M.complete_projects })
+	vim.api.nvim_create_user_command("TodoistSync", M.sync_current_buffer, {})
+	vim.api.nvim_create_user_command("TodoistToggle", M.toggle_task, {})
 
-	for _, proj in ipairs(data.projects) do
-		local completed_data = client.get_all_completed({
-			project_id = proj.id,
-			annotate_items = true,
-		})
-		if completed_data ~= nil then
-			for _, item in ipairs(completed_data.items) do
-				store_data.items[item.task_id] = item.item_object
+	-- Create autocommands
+	local augroup = vim.api.nvim_create_augroup("TodoistNvim", { clear = true })
+
+	vim.api.nvim_create_autocmd("BufWritePost", {
+		group = augroup,
+		pattern = "*.todoist.md",
+		callback = function()
+			if M.config.auto_sync then
+				M.sync_current_buffer()
 			end
-		end
-	end
-	-- print(vim.inspect(store_data))
-	M.store:upsert(store_data)
-end
+		end,
+	})
 
-function M.find_projects()
-	local projects = M.store:get("projects")
-	if projects == nil then
-		return {}
+	-- Set up auto-sync timer
+	if M.config.auto_sync then
+		M.start_auto_sync()
 	end
 
-	local fzf_lua = require("fzf-lua")
-
-	local items = {}
-	for _, proj in pairs(projects) do
-		table.insert(items, proj)
-	end
-	table.sort(items, function(a, b)
-		return a.child_order < b.child_order
-	end)
-	local content = {}
-	for _, proj in ipairs(items) do
-		table.insert(content, proj.name .. "\t\t" .. proj.id)
-	end
-
-	fzf_lua.fzf_exec(content, {
-		prompt = "Select a project",
-		fzf_opts = {
-			["-d"] = "\t\t",
-			["--with-nth"] = "1",
-		},
-		actions = {
-			["default"] = {
-				function(selected)
-					local selected_id = selected[1]:match("[^\t\t]+$")
-					vim.api.nvim_win_close(0, true)
-					M.open_project(selected_id)
-				end,
-			},
-		},
+	-- Key mappings for todoist buffers
+	vim.api.nvim_create_autocmd("FileType", {
+		group = augroup,
+		pattern = "markdown",
+		callback = function()
+			local bufname = vim.api.nvim_buf_get_name(0)
+			if bufname:match("%.todoist%.md$") then
+				vim.keymap.set({ "n", "i" }, "<C-t>", M.toggle_task, { buffer = true })
+				vim.keymap.set("n", "<leader>ts", M.sync_current_buffer, { buffer = true })
+			end
+		end,
 	})
 end
 
-function M.add_item(opts)
-	local project_id = opts.project_id
-	local section_id = opts.section_id
-	local parent_id = opts.parent_id
-	local content = vim.fn.input("Enter the task content: ")
-	local description = vim.fn.input("Enter the task description: ")
+-- List all projects
+function M.list_projects()
+	api.get_projects(function(result)
+		if result.error then
+			vim.notify("Error fetching projects: " .. result.error, vim.log.levels.ERROR)
+			return
+		end
+
+		projects = result.data
+		ui.show_project_list(projects, M.open_project)
+	end)
 end
-local function make_item(opts)
-	table.insert(opts.content, "")
 
-	local check_box = opts.item.completed_at ~= vim.NIL and "- [x]" or "- [ ]"
-
-	table.insert(
-		opts.content,
-		string.rep("\t", opts.depth) .. check_box .. " " .. opts.item.content .. " {%item/" .. opts.item.id .. "}"
-	)
-	local start_row = #opts.content
-
-	if #opts.item.description > 0 then
-		table.insert(opts.content, "")
-		local description_lines = vim.split(opts.item.description, "\n", { trimempty = true })
-		for _, description_line in ipairs(description_lines) do
-			if #description_line > 0 then
-				table.insert(opts.content, string.rep("\t", opts.depth + 1) .. description_line)
-			else
-				table.insert(opts.content, string.rep("\t", opts.depth + 1))
+-- Create a new project
+function M.create_project(name)
+	if not name or name == "" then
+		vim.ui.input({ prompt = "Project name: " }, function(input)
+			if input and input ~= "" then
+				M.create_project(input)
 			end
-		end
-	end
-	local end_row = #opts.content
-
-	opts.metadata.items[opts.item.id] = { range = { start_row, end_row }, item = opts.item }
-
-	for _, sub_item in ipairs(opts.items_list) do
-		if sub_item.parent_id == opts.item.id then
-			make_item({
-				content = opts.content,
-				item = sub_item,
-				items_list = opts.items_list,
-				metadata = opts.metadata,
-				depth = opts.depth + 1,
-			})
-		end
+		end)
+		return
 	end
 
-	table.insert(opts.content, "")
+	api.create_project(name, function(result)
+		if result.error then
+			vim.notify("Error creating project: " .. result.error, vim.log.levels.ERROR)
+			return
+		end
+
+		vim.notify("Project '" .. name .. "' created successfully!", vim.log.levels.INFO)
+		M.list_projects() -- Refresh project list
+	end)
 end
 
-function M.open_project(project_id)
-	local projects = M.store:get("projects")
-	local sections = M.store:get("sections")
-	local items = M.store:get("items")
-
-	local _metadata = {
-		projects = {},
-		sections = {},
-		items = {},
-		items_by_marks = {},
-	}
-
-	local project
-	for _, proj in pairs(projects) do
-		if proj.id == project_id then
-			project = proj
+-- Open a project as markdown
+function M.open_project(project_name)
+	local project = nil
+	for _, p in ipairs(projects) do
+		if p.name == project_name then
+			project = p
 			break
 		end
 	end
 
-	local project_sections = {}
-	for _, section in pairs(sections) do
-		if section.project_id == project_id then
-			table.insert(project_sections, section)
-		end
+	if not project then
+		vim.notify("Project not found: " .. project_name, vim.log.levels.ERROR)
+		return
 	end
 
-	local project_items = {}
-	for _, item in pairs(items) do
-		if item.project_id == project_id and item.section_id == vim.NIL then
-			table.insert(project_items, item)
+	current_project = project
+
+	-- Get project data with tasks and sections
+	api.get_project_data(project.id, function(result)
+		if result.error then
+			vim.notify("Error fetching project data: " .. result.error, vim.log.levels.ERROR)
+			return
 		end
-	end
 
-	local content = {
-		"# " .. project.name .. " {%project/" .. project.id .. "}",
-	}
+		local filename = project.name:gsub("[^%w%s%-_]", "") .. ".todoist.md"
+		local filepath = vim.fn.expand("~/todoist/" .. filename)
 
-	_metadata.projects[project.id] = { range = { #content, #content } }
+		-- Ensure directory exists
+		vim.fn.mkdir(vim.fn.fnamemodify(filepath, ":h"), "p")
 
-	table.sort(project_items, function(a, b)
-		return a.child_order < b.child_order
+		-- Create buffer
+		local buf = vim.api.nvim_create_buf(false, false)
+		vim.api.nvim_buf_set_name(buf, filepath)
+
+		-- Generate markdown content
+		local content = parser.project_to_markdown(result.data)
+		vim.api.nvim_buf_set_lines(buf, 0, -1, false, content.lines)
+
+		-- Set extmarks for tracking
+		parser.set_extmarks(buf, ns_id, content.extmarks)
+
+		-- Open buffer in current window
+		vim.api.nvim_set_current_buf(buf)
+		vim.bo.filetype = "markdown"
+		vim.bo.modified = false
+
+		vim.notify("Opened project: " .. project.name, vim.log.levels.INFO)
 	end)
-	if not M._show_completed then
-		for i = #project_items, 1, -1 do
-			local item = project_items[i]
-			if item.completed_at ~= vim.NIL then
-				table.remove(project_items, i)
-			end
-		end
+end
+
+-- Sync current buffer with Todoist
+function M.sync_current_buffer()
+	local buf = vim.api.nvim_get_current_buf()
+	local bufname = vim.api.nvim_buf_get_name(buf)
+
+	if not bufname:match("%.todoist%.md$") then
+		vim.notify("Not a Todoist buffer", vim.log.levels.WARN)
+		return
 	end
-	table.sort(project_sections, function(a, b)
-		return a.section_order < b.section_order
+
+	if not current_project then
+		vim.notify("No current project", vim.log.levels.ERROR)
+		return
+	end
+
+	local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+	local extmarks = vim.api.nvim_buf_get_extmarks(buf, ns_id, 0, -1, { details = true })
+
+	sync.sync_buffer_changes(current_project.id, lines, extmarks, function(result)
+		if result.error then
+			vim.notify("Sync error: " .. result.error, vim.log.levels.ERROR)
+			return
+		end
+
+		vim.notify("Synced successfully!", vim.log.levels.INFO)
+		vim.bo.modified = false
+
+		-- Update extmarks with new data
+		if result.data and result.data.extmarks then
+			vim.api.nvim_buf_clear_namespace(buf, ns_id, 0, -1)
+			parser.set_extmarks(buf, ns_id, result.data.extmarks)
+		end
 	end)
-	for _, item in ipairs(project_items) do
-		if item.parent_id == vim.NIL then
-			make_item({
-				content = content,
-				item = item,
-				depth = 0,
-				metadata = _metadata,
-				items_list = project_items,
-			})
-		end
-	end
-	for _, section in ipairs(project_sections) do
-		table.insert(content, "")
-		table.insert(content, "## " .. section.name .. " {%section/" .. section.id .. "}")
+end
 
-		_metadata.sections[section.id] = { range = { #content, #content } }
+-- Toggle task completion
+function M.toggle_task()
+	local buf = vim.api.nvim_get_current_buf()
+	local cursor = vim.api.nvim_win_get_cursor(0)
+	local line_num = cursor[1] - 1
 
-		for _, item in pairs(items) do
-			if item.section_id == section.id and item.parent_id == vim.NIL then
-				make_item({
-					content = content,
-					item = item,
-					depth = 0,
-					metadata = _metadata,
-					items_list = project_items,
-				})
-			end
+	-- Find extmark for current line or nearby lines
+	local extmarks = vim.api.nvim_buf_get_extmarks(
+		buf,
+		ns_id,
+		{ line_num - 2, 0 },
+		{ line_num + 2, -1 },
+		{ details = true }
+	)
+
+	local task_extmark = nil
+	for _, mark in ipairs(extmarks) do
+		local data = mark[4]
+		if data and data.todoist_type == "task" then
+			task_extmark = mark
+			break
 		end
 	end
 
-	local buffer = u.create_project_buffer(content)
-	local api = vim.api
-
-	for id, o in pairs(_metadata.items) do
-		local ext_id = api.nvim_buf_set_extmark(buffer, M.nid, o.range[1] - 1, 0, {
-			virt_text = { { "(" .. id .. ")", "Comment" } },
-			virt_text_pos = "eol",
-			end_row = o.range[2],
-			invalidate = true,
-			undo_restore = true,
-			virt_text_hide = true,
-		})
-		_metadata.items_by_marks[ext_id] = o.item
+	if not task_extmark then
+		vim.notify("No task found on current line", vim.log.levels.WARN)
+		return
 	end
 
-	api.nvim_buf_set_keymap(buffer, "n", "q", "", {
-		noremap = true,
-		callback = function()
-			api.nvim_buf_delete(buffer, { force = true })
-		end,
-	})
-	api.nvim_buf_set_keymap(buffer, "n", "<cr>", "", {
-		noremap = true,
-		callback = function()
-			vim.api.nvim_set_option_value("modifiable", true, { scope = "local" })
-			local status = u.buf_toggle_task_list_item()
-			vim.api.nvim_set_option_value("modifiable", false, { scope = "local" })
-			local mark = u.get_mark_at_line(M.nid)
-			if status == "checked" and mark then
-				local item_id = _metadata.items_by_marks[mark[1]].id
-				client.complete_item(item_id)
-			elseif status == "unchecked" and mark then
-				local item_id = _metadata.items_by_marks[mark[1]].id
-				client.uncomplete_item(item_id)
+	local task_id = task_extmark[4].todoist_id
+	local current_line = vim.api.nvim_buf_get_lines(buf, line_num, line_num + 1, false)[1]
+
+	-- Toggle checkbox in markdown
+	local new_line
+	if current_line:match("%- %[ %]") then
+		new_line = current_line:gsub("%- %[ %]", "- [x]")
+	elseif current_line:match("%- %[x%]") then
+		new_line = current_line:gsub("%- %[x%]", "- [ ]")
+	else
+		vim.notify("Current line is not a task", vim.log.levels.WARN)
+		return
+	end
+
+	-- Update buffer
+	vim.api.nvim_buf_set_lines(buf, line_num, line_num + 1, false, { new_line })
+
+	-- Sync with Todoist API
+	local is_completed = new_line:match("%- %[x%]") ~= nil
+	api.toggle_task(task_id, is_completed, function(result)
+		if result.error then
+			vim.notify("Error toggling task: " .. result.error, vim.log.levels.ERROR)
+			-- Revert the change
+			vim.api.nvim_buf_set_lines(buf, line_num, line_num + 1, false, { current_line })
+		else
+			vim.notify("Task " .. (is_completed and "completed" or "reopened"), vim.log.levels.INFO)
+		end
+	end)
+end
+
+-- Auto-sync functionality
+function M.start_auto_sync()
+	if sync_timer then
+		vim.loop.timer_stop(sync_timer)
+	end
+
+	sync_timer = vim.loop.new_timer()
+	sync_timer:start(
+		M.config.sync_interval,
+		M.config.sync_interval,
+		vim.schedule_wrap(function()
+			local buf = vim.api.nvim_get_current_buf()
+			local bufname = vim.api.nvim_buf_get_name(buf)
+
+			if bufname:match("%.todoist%.md$") and not vim.bo.modified then
+				M.sync_current_buffer()
 			end
-		end,
-	})
-	api.nvim_buf_set_keymap(buffer, "n", "<tab>", "", {
-		noremap = true,
-		nowait = true,
-		callback = function()
-			u.buf_next_task()
-		end,
-	})
-	api.nvim_buf_set_keymap(buffer, "n", "<S-tab>", "", {
-		noremap = true,
-		nowait = true,
-		callback = function()
-			u.buf_prev_task()
-		end,
-	})
-	api.nvim_buf_set_keymap(buffer, "n", "&", "", {
-		noremap = true,
-		nowait = true,
-		callback = function()
-			local mark = u.get_mark_at_line(M.nid)
-			-- -- local text = ms[1][3].virt_text
-			print(vim.inspect(_metadata.items_by_marks[mark[1]]))
-		end,
-	})
+		end)
+	)
+end
+
+function M.stop_auto_sync()
+	if sync_timer then
+		vim.loop.timer_stop(sync_timer)
+		sync_timer = nil
+	end
+end
+
+-- Completion function for project names
+function M.complete_projects(arg_lead, cmd_line, cursor_pos)
+	local matches = {}
+	for _, project in ipairs(projects) do
+		if project.name:lower():find(arg_lead:lower(), 1, true) then
+			table.insert(matches, project.name)
+		end
+	end
+	return matches
 end
 
 return M
