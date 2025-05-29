@@ -40,56 +40,85 @@ function M.project_to_markdown(project_data)
 		print("DEBUG: Sections count:", #(project_data.sections or {}))
 	end
 
-	-- Group tasks by section
-	local sections = {}
-	local unsectioned_tasks = {}
+	-- Create ordered list of content items (sections and unsectioned tasks)
+	local content_items = {}
+	local sectioned_tasks = {}
 
-	-- Create section lookup
-	local section_lookup = {}
+	-- Group tasks by section
+	local task_by_section = {}
+	for _, task in ipairs(project_data.tasks or {}) do
+		if config.is_valid(task) then
+			if config.is_valid(task.section_id) then
+				if not task_by_section[task.section_id] then
+					task_by_section[task.section_id] = {}
+				end
+				table.insert(task_by_section[task.section_id], task)
+				sectioned_tasks[task.id] = true
+			end
+		end
+	end
+
+	-- Add sections to content items
 	for _, section in ipairs(project_data.sections or {}) do
 		if config.is_valid(section) and config.is_valid(section.id) then
-			section_lookup[section.id] = section
-			sections[section.id] = {
-				section = section,
-				tasks = {},
-			}
-		end
-	end
+			local section_order = config.is_valid(section.order) and section.order or 999999
+			table.insert(content_items, {
+				type = "section",
+				data = section,
+				tasks = task_by_section[section.id] or {},
+				order = section_order,
+			})
 
-	-- Group tasks
-	for _, task in ipairs(project_data.tasks or {}) do
-		if config.is_debug() then
-			print("DEBUG: Processing task:", vim.inspect(task))
-		end
-
-		if config.is_valid(task) then
-			if config.is_valid(task.section_id) and sections[task.section_id] then
-				table.insert(sections[task.section_id].tasks, task)
-			else
-				table.insert(unsectioned_tasks, task)
-			end
-		end
-	end
-
-	-- Add unsectioned tasks first
-	if #unsectioned_tasks > 0 then
-		if config.is_debug() then
-			print("DEBUG: Adding", #unsectioned_tasks, "unsectioned tasks")
-		end
-		M.add_tasks_to_markdown(unsectioned_tasks, lines, extmarks, nil)
-		table.insert(lines, "")
-	end
-
-	-- Add sectioned tasks
-	for section_id, section_data in pairs(sections) do
-		if #section_data.tasks > 0 then
 			if config.is_debug() then
-				print("DEBUG: Adding section", section_data.section.name, "with", #section_data.tasks, "tasks")
+				print(
+					"DEBUG: Added section to content:",
+					section.name,
+					"order:",
+					section_order,
+					"tasks:",
+					#(task_by_section[section.id] or {})
+				)
 			end
+		end
+	end
 
+	-- Add unsectioned tasks to content items
+	for _, task in ipairs(project_data.tasks or {}) do
+		if config.is_valid(task) and not sectioned_tasks[task.id] then
+			local task_order = config.is_valid(task.order) and task.order or 999999
+			table.insert(content_items, {
+				type = "task",
+				data = task,
+				order = task_order,
+			})
+
+			if config.is_debug() then
+				print("DEBUG: Added unsectioned task to content:", task.content, "order:", task_order)
+			end
+		end
+	end
+
+	-- Sort content items by order
+	table.sort(content_items, function(a, b)
+		return a.order < b.order
+	end)
+
+	if config.is_debug() then
+		print("DEBUG: Content items order:")
+		for i, item in ipairs(content_items) do
+			if item.type == "section" then
+				print("  ", i, "Section:", item.data.name, "order:", item.order)
+			else
+				print("  ", i, "Task:", item.data.content, "order:", item.order)
+			end
+		end
+	end
+
+	-- Render content items in order
+	for _, item in ipairs(content_items) do
+		if item.type == "section" then
 			-- Add section header
-			local section_name = config.is_valid(section_data.section.name) and section_data.section.name
-				or "Untitled Section"
+			local section_name = config.is_valid(item.data.name) and item.data.name or "Untitled Section"
 			table.insert(lines, "## " .. section_name)
 			table.insert(extmarks, {
 				line = #lines - 1,
@@ -101,19 +130,25 @@ function M.project_to_markdown(project_data)
 				-- Store our custom data separately
 				todoist_data = {
 					type = "section",
-					id = tostring(section_data.section.id),
+					id = tostring(item.data.id),
 					name = section_name,
 				},
 			})
 			table.insert(lines, "")
 
-			M.add_tasks_to_markdown(section_data.tasks, lines, extmarks, section_id)
-			table.insert(lines, "")
+			-- Add tasks for this section
+			if #item.tasks > 0 then
+				M.add_tasks_to_markdown(item.tasks, lines, extmarks, item.data.id)
+				table.insert(lines, "")
+			end
+		elseif item.type == "task" then
+			-- Add unsectioned task
+			M.add_single_task_to_markdown(item.data, lines, extmarks, 0, {})
 		end
 	end
 
-	-- If no tasks at all, add a helpful message
-	if #unsectioned_tasks == 0 and vim.tbl_count(sections) == 0 then
+	-- If no content at all, add a helpful message
+	if #content_items == 0 then
 		table.insert(lines, "_No tasks found. Start typing to add some!_")
 		table.insert(lines, "")
 		table.insert(lines, "## Example")
@@ -153,28 +188,38 @@ function M.add_tasks_to_markdown(tasks, lines, extmarks, section_id)
 		end
 	end
 
-	-- Sort tasks by order if available
+	-- Sort root tasks by order
 	table.sort(root_tasks, function(a, b)
-		local order_a = config.is_valid(a.order) and a.order or 0
-		local order_b = config.is_valid(b.order) and b.order or 0
+		local order_a = config.is_valid(a.order) and a.order or 999999
+		local order_b = config.is_valid(b.order) and b.order or 999999
 		return order_a < order_b
 	end)
+
+	-- Sort all child task groups by order
+	for parent_id, children in pairs(task_children) do
+		table.sort(children, function(a, b)
+			local order_a = config.is_valid(a.order) and a.order or 999999
+			local order_b = config.is_valid(b.order) and b.order or 999999
+			return order_a < order_b
+		end)
+	end
 
 	if config.is_debug() then
 		print("DEBUG: Root tasks for section:", #root_tasks)
 		for i, task in ipairs(root_tasks) do
 			local content = config.is_valid(task.content) and task.content or "No content"
-			print("DEBUG: Root task", i, ":", content, "ID:", task.id)
+			local order = config.is_valid(task.order) and task.order or "no order"
+			print("DEBUG: Root task", i, ":", content, "ID:", task.id, "order:", order)
 		end
 	end
 
 	-- Add tasks recursively
 	for _, task in ipairs(root_tasks) do
-		M.add_task_to_markdown(task, lines, extmarks, 0, task_children)
+		M.add_single_task_to_markdown(task, lines, extmarks, 0, task_children)
 	end
 end
 
-function M.add_task_to_markdown(task, lines, extmarks, depth, task_children)
+function M.add_single_task_to_markdown(task, lines, extmarks, depth, task_children)
 	local indent = string.rep("  ", depth)
 	local is_completed = config.is_valid(task.is_completed) and task.is_completed or false
 	local checkbox = is_completed and "[x]" or "[ ]"
@@ -216,23 +261,21 @@ function M.add_task_to_markdown(task, lines, extmarks, depth, task_children)
 		table.insert(lines, "")
 	end
 
-	-- Add children
+	-- Add children (already sorted)
 	if config.is_valid(task.id) and task_children[task.id] then
-		-- Sort children by order
-		table.sort(task_children[task.id], function(a, b)
-			local order_a = config.is_valid(a.order) and a.order or 0
-			local order_b = config.is_valid(b.order) and b.order or 0
-			return order_a < order_b
-		end)
-
 		if config.is_debug() then
 			print("DEBUG: Adding", #task_children[task.id], "children for task:", task_content)
 		end
 
 		for _, child in ipairs(task_children[task.id]) do
-			M.add_task_to_markdown(child, lines, extmarks, depth + 1, task_children)
+			M.add_single_task_to_markdown(child, lines, extmarks, depth + 1, task_children)
 		end
 	end
+end
+
+-- Backward compatibility - keep the old function name
+function M.add_task_to_markdown(task, lines, extmarks, depth, task_children)
+	return M.add_single_task_to_markdown(task, lines, extmarks, depth, task_children)
 end
 
 -- Global storage for extmark data (since we can't store custom data in extmarks directly)
