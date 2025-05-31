@@ -9,6 +9,42 @@ local config = require("todoist.config")
 M.namespace_id = vim.api.nvim_create_namespace("todoist")
 M.buffers = {} -- Track todoist buffers
 
+function M.show_project_list(projects)
+	if config.is_debug() then
+		print("DEBUG: Showing project list with", #projects, "projects")
+	end
+
+	-- Create project selection items
+	local items = {}
+	for _, project in ipairs(projects) do
+		if config.is_valid(project) and config.is_valid(project.name) then
+			table.insert(items, {
+				text = project.name,
+				data = project,
+			})
+		end
+	end
+
+	-- Show selection UI
+	vim.ui.select(items, {
+		prompt = "Select a Todoist project:",
+		format_item = function(item)
+			local icon = item.data.is_favorite and "⭐ " or "📋 "
+			return icon .. item.text
+		end,
+	}, function(selected)
+		if selected then
+			if config.is_debug() then
+				print("DEBUG: User selected project:", selected.data.name)
+				print("DEBUG: Opening project:", vim.inspect(selected.data))
+			end
+
+			-- Use buffer.lua to open the project
+			local buffer = require("todoist.buffer")
+			buffer.open_project(selected.data.id)
+		end
+	end)
+end
 function M.open_project(project_id)
 	if not config.is_valid(project_id) then
 		vim.notify("Invalid project ID", vim.log.levels.ERROR)
