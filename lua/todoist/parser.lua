@@ -27,8 +27,8 @@ function M.project_to_markdown(project_data)
 
 	-- Add project title
 	local project_name = "Untitled Project"
-	if config.is_valid(project_data) and config.is_valid(project_data.name) then
-		project_name = project_data.name
+	if config.is_valid(project_data.project) and config.is_valid(project_data.project.name) then
+		project_name = project_data.project.name
 	end
 
 	table.insert(lines, "# " .. project_name)
